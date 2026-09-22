@@ -1,0 +1,162 @@
+seed: 42
+
+weights:
+  pft: checkpoints/pft-xl_step400k_ema.ckpt
+  vae: checkpoints/sd_ae.ckpt
+  # setup_vton.py downloads this folder. DINO is training-only for CORAL.
+  dino: checkpoints/dinov3-vits16-pretrain-lvd1689m
+
+data:
+  root: ../high-resolution-viton-zalando-dataset
+  pairs_file: null
+  test_pairs_file: ${data.root}/preview_pairs.txt
+  test_order: paired
+  require_cloth_mask: true
+  require_parse: true
+  # LIP/VITON-HD: upper-clothes, dress, coat.
+  clothing_labels: [5, 6, 7]
+  num_workers: 8
+
+model:
+  image_hw: [512, 384]
+  latent_hw: [64, 48]
+  patch_size: 2
+  # 1 -> 64x48 garment K/V (3072 keys) while PFT person stays 32x24 (768 queries).
+  # High-resolution global K/V; dense transport below is the local detail carrier.
+  garment_patch_size: 1
+  cross_blocks: [4, 8, 12, 16, 20, 24, 27]
+  # Only these blocks materialize attention matrices for CORAL to save VRAM.
+  coral_blocks: [24]
+  qk_norm: true
+  cross_logit_scale: 10.0
+  cross_init_gate: 0.01
+  # The transport route carries local color/text without global attention
+  # averaging. Its verified affine geometry is frozen below.
+  use_dense_transport: true
+  # Fit the complete garment silhouette into the editable torso while
+  # preserving aspect ratio.
+  transport_mask_aligned_base: true
+  # Paired RGB reconstruction is not correspondence supervision. V6 reduced its
+  # loss by bending letters, so V7 uses the verified base with zero dense offset.
+  transport_geometry_only: true
+  transport_learned_residual: false
+  transport_max_offset: 0.0
+  # Online transport only: no dataset-provided or precomputed warped cloth.
+  transport_fixed_gate: 0.05
+  transport_blocks: [4, 8, 12, 16, 20, 24, 27]
+  transport_block_gate: 0.10
+  # The residual flow now starts from the warp itself, so an unconditional
+  # t-independent velocity shortcut is unnecessary and can double-apply it.
+  transport_output_scale: 0.0
+  # Semantic attention supplies garment context but must not overwrite the
+  # pixel-faithful warp carried by the residual-flow source endpoint.
+  cross_attention_scale: 0.10
+  # Keep the original warped endpoint explicitly available at every t. Current
+  # x_t alone becomes target-like and otherwise forgets exact source identity.
+  source_condition_scale: 1.0
+
+flow:
+  ltg_std: 0.6
+  ltg_loc: 0.7
+  ltg_scale: 1.0
+  # Deterministic VTON starts from the exact VAE encoding of the full-resolution
+  # warp. Only pixels unsupported by the source garment start from noise.
+  source_noise_std: 0.0
+  source_confidence_erode_px: 4
+  # Inference advances every edited token at the same time. Train on that same
+  # state distribution instead of almost exclusively asynchronous token times.
+  synchronous_probability: 1.0
+  synchronous_uniform: true
+  synchronous_detail: true
+  pure_noise_probability: 0.20
+  detail_refine_probability: 0.20
+  detail_time_range: [0.78, 0.98]
+  # Keep extra endpoint grounding early, but still cover the whole ODE path.
+  grounding_steps: 1000
+  grounding_pure_noise_probability: 0.35
+  grounding_detail_refine_probability: 0.15
+
+coral:
+  # The learned dense warp already has the correct correspondence. DINO routing
+  # is semantic and was encouraging plausible substitutions for exact graphics.
+  weight: 0.0
+  entropy_weight: 0.0
+  gaussian_sigma: 0.015
+  # DINO route targets conflicted with the improving pixel-aligned transport.
+  transport_weight: 0.0
+  min_similarity: 0.20
+  cycle_radius: 0.10
+  detail_edge_boost: 1.0
+
+loss:
+  uncertainty_weight: 0.01
+  # Upweights small boundaries/text strokes in latent flow MSE.
+  edge_flow_boost: 1.5
+  clothing_boost: 3.0
+  # Endpoint latent supervision runs at every time. Decode half of nonzero-time
+  # batches as well so every part of the sampled trajectory preserves appearance.
+  decoded_probability: 0.50
+  decoded_pure_only: false
+  decoded_latent_weight: 1.00
+  decoded_rgb_weight: 0.30
+  decoded_edge_weight: 0.20
+  decoded_laplacian_weight: 0.20
+  decoded_color_weight: 0.30
+  decoded_time_floor: 0.10
+  # Report transport metrics, but never optimize the frozen geometry against
+  # unregistered shop-vs-worn pixels; that objective caused the V6 regression.
+  transport_latent_weight: 0.0
+  transport_smoothness_weight: 0.0
+  transport_offset_weight: 0.0
+  transport_rgb_weight: 0.0
+  transport_edge_weight: 0.0
+  transport_laplacian_weight: 0.0
+  transport_color_weight: 0.0
+
+optim:
+  lr: 1.0e-4
+  weight_decay: 0.01
+  pretrained_lr_multiplier: 0.25
+  # Parameter-efficient adaptation of every transformer block: qkv/proj, both
+  # MLP projections and adaLN modulation. Base PFT weights remain frozen.
+  lora_rank: 8
+  lora_alpha: 16
+  lora_dropout: 0.0
+  lora_include_adaln: true
+  lora_lr: 5.0e-5
+  lora_weight_decay: 0.0
+  # V3/V4 predict velocity from Gaussian noise. V5 starts from an image-like
+  # warp, so initialize the residual field as identity instead of destroying it.
+  reset_final_output_on_load: true
+  reset_transport_flow_output_on_load: false
+  reset_transport_geometry_input_on_load: false
+  clip_grad_norm: 1.0
+  warmup_steps: 100
+  min_lr_ratio: 0.10
+  train_self_attention: false
+  self_attention_blocks: []
+  train_final_layer: true
+  train_transport_flow: false
+  train_transport_output: false
+
+train:
+  # Same effective batch (32) as v1, with headroom for late-block gradients,
+  # dense transport and decoded detail losses on a 24 GB RTX 3090.
+  batch_size: 2
+  gradient_accumulation_steps: 16
+  mixed_precision: bf16
+  max_steps: 12000
+
+  log_every: 10
+  save_every: 1000
+
+  tensorboard: true
+
+  preview_every: 250
+  preview_steps: 50
+  preview_num_samples: 4
+  preview_seed: 12345
+  preview_order: paired
+  preview_at_start: true
+
+  output_dir: logs/vton-v7-frozen-warp-lora
