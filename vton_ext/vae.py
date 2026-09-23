@@ -6,7 +6,12 @@ from jutils.nn.kl_autoencoder import AutoencoderKL
 
 
 def load_sd_vae(checkpoint: str, device: torch.device, dtype: torch.dtype = torch.float32) -> AutoencoderKL:
-    vae = AutoencoderKL(ckpt_path=checkpoint).to(device=device, dtype=dtype).eval()
+    # The upstream loader restores tensors to the checkpoint's saved CUDA
+    # device before copying them into its CPU module. Load on CPU explicitly
+    # to avoid transient duplicate GPU allocations during model startup.
+    vae = AutoencoderKL(ckpt_path=None)
+    vae.load_state_dict(torch.load(checkpoint, map_location="cpu", weights_only=True))
+    vae = vae.to(device=device, dtype=dtype).eval()
     vae.requires_grad_(False)
     return vae
 

@@ -40,10 +40,17 @@ def expand_patch_values(values: torch.Tensor, patch_size: int, hw: Tuple[int, in
 
 
 def latent_edit_mask(pixel_mask: torch.Tensor, latent_hw: Tuple[int, int]) -> torch.Tensor:
-    """Convert 1=editable pixel mask to latent mask without bleeding outside the source mask."""
+    """Conservatively convert a pixel edit mask to latent-cell occupancy.
+
+    A latent cell is editable when *any* source pixel covered by it is editable.
+    Area/nearest resizing can silently drop thin sleeves and boundary strips;
+    adaptive max pooling preserves that support. Pixel-space compositing still
+    guarantees exact preservation outside the requested RGB mask.
+    """
     if pixel_mask.ndim == 3:
         pixel_mask = pixel_mask[:, None]
-    return F.interpolate(pixel_mask.float(), size=latent_hw, mode="area").clamp(0, 1)
+    pooled = F.adaptive_max_pool2d(pixel_mask.float(), latent_hw)
+    return (pooled > 0.0).to(pixel_mask.dtype)
 
 
 def token_edit_mask(latent_mask: torch.Tensor, patch_size: int) -> torch.Tensor:

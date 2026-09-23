@@ -1,0 +1,131 @@
+# V42: decoded garment-detail loss, continued from the full V41 step-6000
+# resume checkpoint to the end of the original 20k-step cosine horizon.
+#
+# V41 audit (step 6000, 8 fixed logo cases): garment placement and colour are
+# right, glyph strokes are not. Garment CFG ~2 visibly repairs letters (Lee,
+# GAP, Wrangler) at the same noise; CFG 3 over-saturates colour. L1 prefers the
+# blurry posterior mean, so previews, not L1 alone, decide text quality.
+#
+# PYTHONPATH=. python -m vton_ext.pfi_train \
+#   --config configs/vton_v42_pfi_decoded_detail.yaml \
+#   --resume logs/vton-v41-pfi-detail/latest.pt
+#
+# Keep optimizer, curriculum state, mixture weights and architecture. Add only
+# sparse decoded RGB/high-pass supervision. Preserve the 20k-step LR horizon.
+seed: 42
+
+weights:
+  pft: checkpoints/pft-xl_step400k_ema.ckpt
+  vae: checkpoints/sd_ae.ckpt
+  dino: checkpoints/dinov3-vits16-pretrain-lvd1689m
+
+data:
+  root: ../high-resolution-viton-zalando-dataset
+  pairs_file: ${data.root}/train_fit_pairs.txt
+  test_pairs_file: ${data.root}/train_dev_pairs.txt
+  official_paired_pairs_file: ${data.root}/test_pairs_paired.txt
+  official_unpaired_pairs_file: ${data.root}/test_pairs.txt
+  clothing_labels: [5, 6, 7]
+  num_workers: 8
+  augment: true
+  person_translate_fraction: 0.03
+  person_scale_range: [0.96, 1.04]
+  garment_translate_fraction: 0.05
+  garment_scale_range: [0.94, 1.06]
+  # Open (dilate) the agnostic mask by a random radius in pixels at 512x384.
+  # The ring is grayed out and regenerated, so a slightly wrong mask cannot
+  # leak old-garment pixels into the context. Inference: eval.mask_open_px.
+  mask_open_px_range: [0, 12]
+
+model:
+  image_hw: [512, 384]
+  latent_hw: [64, 48]
+  patch_size: 2
+  # Middle blocks: early blocks lack semantics, late blocks are pixel-local.
+  coral_blocks: [8, 12, 16, 20]
+  # Supervise only the first heads of each block; the rest stay free for
+  # person-person context and for non-correspondence garment cues.
+  coral_heads: 4
+
+flow:
+  # Editable-token times; mixture weights follow a curriculum (see
+  # EditTimeSampler). Remaining probability mass = LTG patch forcing around a
+  # logit-normal mean.
+  ltg_std: 0.6
+  ltg_loc: 0.0
+  ltg_scale: 1.0
+  curriculum:
+    # Grounding: many pure-noise examples, where only the garment/pose branch
+    # can explain the target -> the model must learn to read the garment.
+    start: {pure_noise: 0.50, synchronous: 0.20, detail: 0.00}
+    # Refinement: pure noise kept for the inference start state, budget moved
+    # to late times where the remaining error is high-frequency detail.
+    end: {pure_noise: 0.10, synchronous: 0.15, detail: 0.40}
+    detail_range: [0.75, 0.98]
+    detail_std: 0.05             # cap the half-normal lag for detail examples only
+    # "Condition good enough": person->garment attention mass within 2 sigma
+    # of the DINOv3 correspondence (about 0.08 at initialisation).
+    gate_metric: coral_local_mass
+    gate_threshold: 0.30
+    gate_min_steps: 1500
+    gate_max_steps: 6000
+    ramp_steps: 3000
+  # Null garment for optional classifier-free guidance at inference.
+  garment_dropout: 0.10
+
+coral:
+  weight: 0.10
+  entropy_weight: 0.01
+  gaussian_sigma: 0.04
+  min_similarity: 0.20
+  cycle_radius: 0.10
+
+loss:
+  uncertainty_weight: 0.01
+  clothing_boost: 1.0
+  decoded_rgb_weight: 0.5
+  decoded_highpass_weight: 2.0
+  decoded_graphic_boost: 2.0  # target-derived contrast proxy; never inference input
+  decoded_min_time: 0.65
+  decoded_probability: 0.5
+  decoded_max_images: 1
+
+optim:
+  lr: 1.0e-4                     # new embedders / role embeddings
+  pretrained_lr_multiplier: 0.2  # 2e-5 for the full PFT backbone
+  weight_decay: 0.0
+  warmup_steps: 500
+  min_lr_ratio: 0.1
+  clip_grad_norm: 1.0
+
+train:
+  batch_size: 4
+  gradient_accumulation_steps: 4   # effective batch 16
+  gradient_checkpointing: true
+  max_steps: 20000               # retain the original cosine LR horizon
+  stop_at_step: 20000            # full run; judge from the step-500 previews
+  ema_decay: 0.0                  # no EMA: sample and save the raw weights
+  ema_start: 500
+  log_every: 10
+  save_every: 250                  # latest.pt, with optimizer (overwritten)
+  keep_every: 2500                 # weights-only snapshots, 2.7 GB each
+  output_dir: logs/vton-v42-pfi-decoded-detail
+
+eval:
+  every: 500
+  at_start: false
+  seed: 12345
+  batch_size: 4
+  # Same fixed logo/text-heavy dev cases as V29-V33.
+  indices: [23, 65, 44, 115, 163, 232, 93, 152]
+  mask_open_px: 6
+  p: 0.7
+  n_inner: 2
+  # Defaults for vton_ext.pfi_sample. Garment CFG was trained via
+  # flow.garment_dropout; per-token interval, [0, 1] = every step.
+  cfg_scale: 2.0
+  cfg_interval: [0.0, 1.0]
+  samplers:
+    - {name: dual_loop, nfe: 8}
+    - {name: dual_loop, nfe: 8, cfg: 2.0}
+    - {name: euler, nfe: 16, cfg: 2.0}

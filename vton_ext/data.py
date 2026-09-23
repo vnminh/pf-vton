@@ -83,12 +83,32 @@ class VitonHDDataset(Dataset):
         require_cloth_mask: bool = False,
         require_parse: bool = False,
         clothing_labels: Sequence[int] = (5, 6, 7),
+        preserve_skin: bool = False,
+        preserve_known_context: bool = False,
+        augment: bool = False,
+        person_translate_fraction: float = 0.0,
+        person_scale_range: Tuple[float, float] = (1.0, 1.0),
+        garment_translate_fraction: float = 0.0,
+        garment_scale_range: Tuple[float, float] = (1.0, 1.0),
     ):
         self.root = Path(root)
         self.phase = phase
         self.order = order
         self.size = tuple(size)
         self.clothing_labels = tuple(int(v) for v in clothing_labels)
+        self.preserve_skin = bool(preserve_skin)
+        self.preserve_known_context = bool(preserve_known_context)
+        self.augment = bool(augment)
+        self.person_translate_fraction = max(float(person_translate_fraction), 0.0)
+        self.person_scale_range = tuple(float(v) for v in person_scale_range)
+        self.garment_translate_fraction = max(float(garment_translate_fraction), 0.0)
+        self.garment_scale_range = tuple(float(v) for v in garment_scale_range)
+        for name, scale_range in (
+            ("person_scale_range", self.person_scale_range),
+            ("garment_scale_range", self.garment_scale_range),
+        ):
+            if len(scale_range) != 2 or not 0 < scale_range[0] <= scale_range[1]:
+                raise ValueError(f"Invalid {name}: {scale_range}")
         self.base = self.root / phase
         if not self.base.is_dir():
             raise FileNotFoundError(f"Missing VITON-HD split folder: {self.base}")
@@ -106,6 +126,8 @@ class VitonHDDataset(Dataset):
             raise FileNotFoundError("require_cloth_mask=true but no cloth-mask folder was found")
         if require_parse and self.parse_dir is None:
             raise FileNotFoundError("require_parse=true but no human-parse folder was found")
+        if (self.preserve_skin or self.preserve_known_context) and self.parse_dir is None:
+            raise FileNotFoundError("preserving known person context requires human parsing")
 
         if pairs_file is None:
             candidates = []
@@ -172,22 +194,129 @@ class VitonHDDataset(Dataset):
             cloth_mask = torch.ones(1, *self.size, dtype=torch.float32)
 
         clothing_mask = None
+        skin_mask = None
+        known_context_mask = None
         if self.parse_dir is not None:
             try:
                 parse_path = _find_named(self.parse_dir, person_name)
                 clothing_mask = _parse_mask(parse_path, self.size, self.clothing_labels)
+                if self.preserve_skin:
+                    # LIP/VITON-HD labels 13=face, 14/15=arms. Only copy skin
+                    # already visible in the input person image; no garment RGB.
+                    skin_mask = _parse_mask(parse_path, self.size, (13, 14, 15))
+                if self.preserve_known_context:
+                    # Use only confidently non-garment parse classes. Retain an
+                    # editable 10px halo around the old shirt for sleeve changes.
+                    known_context_mask = _parse_mask(
+                        parse_path, self.size,
+                        (0, 1, 2, 3, 4, 8, 9, 12, 13, 14, 15, 16, 17, 18, 19),
+                    )
             except FileNotFoundError:
                 clothing_mask = None
+        if self.preserve_skin and skin_mask is None:
+            raise FileNotFoundError(f"Missing person parse for skin preservation: {person_name}")
+        if self.preserve_known_context and known_context_mask is None:
+            raise FileNotFoundError(f"Missing person parse for context preservation: {person_name}")
         if clothing_mask is None:
             # Safe fallback for datasets without parsing: focus on the editable area.
             clothing_mask = _mask(mask_path, self.size)
 
+        image = _rgb(person_path, self.size)
+        agnostic = _rgb(agnostic_path, self.size)
+        agnostic_mask = _mask(mask_path, self.size)
+        densepose = _rgb(pose_path, self.size)
+        garment = _rgb(garment_path, self.size)
+
+        if self.augment:
+            h, w = self.size
+
+            def parameters(translate_fraction, scale_range):
+                max_dx = int(round(w * translate_fraction))
+                max_dy = int(round(h * translate_fraction))
+                dx = int(torch.randint(-max_dx, max_dx + 1, ()).item()) if max_dx else 0
+                dy = int(torch.randint(-max_dy, max_dy + 1, ()).item()) if max_dy else 0
+                scale = float(
+                    torch.empty(()).uniform_(scale_range[0], scale_range[1]).item()
+                )
+                return [dx, dy], scale
+
+            person_translate, person_scale = parameters(
+                self.person_translate_fraction, self.person_scale_range
+            )
+            garment_translate, garment_scale = parameters(
+                self.garment_translate_fraction, self.garment_scale_range
+            )
+
+            def affine_rgb(x, translate, scale, fill):
+                return TF.affine(
+                    x,
+                    angle=0.0,
+                    translate=translate,
+                    scale=scale,
+                    shear=[0.0, 0.0],
+                    interpolation=InterpolationMode.BILINEAR,
+                    fill=fill,
+                )
+
+            def affine_mask(x, translate, scale):
+                return TF.affine(
+                    x,
+                    angle=0.0,
+                    translate=translate,
+                    scale=scale,
+                    shear=[0.0, 0.0],
+                    interpolation=InterpolationMode.NEAREST,
+                    fill=0.0,
+                )
+
+            image = affine_rgb(image, person_translate, person_scale, 1.0)
+            agnostic = affine_rgb(agnostic, person_translate, person_scale, 1.0)
+            # DensePose visualization uses semantic left/right colors. Translation
+            # and isotropic scale are safe; raw horizontal flipping is not.
+            densepose = affine_rgb(densepose, person_translate, person_scale, -1.0)
+            agnostic_mask = affine_mask(
+                agnostic_mask, person_translate, person_scale
+            )
+            clothing_mask = affine_mask(
+                clothing_mask, person_translate, person_scale
+            )
+            if skin_mask is not None:
+                skin_mask = affine_mask(skin_mask, person_translate, person_scale)
+            if known_context_mask is not None:
+                known_context_mask = affine_mask(
+                    known_context_mask, person_translate, person_scale
+                )
+            garment = affine_rgb(
+                garment, garment_translate, garment_scale, 1.0
+            )
+            cloth_mask = affine_mask(
+                cloth_mask, garment_translate, garment_scale
+            )
+
+        if known_context_mask is not None:
+            shirt_halo = torch.nn.functional.max_pool2d(
+                clothing_mask, kernel_size=21, stride=1, padding=10
+            )
+            known_context_mask = known_context_mask * (1.0 - shirt_halo)
+        if skin_mask is not None:
+            # Conservative interior avoids leaking shirt pixels at arm borders.
+            skin_mask = 1.0 - torch.nn.functional.max_pool2d(
+                1.0 - skin_mask, kernel_size=3, stride=1, padding=1
+            )
+            known_context_mask = (
+                skin_mask if known_context_mask is None
+                else torch.maximum(known_context_mask, skin_mask)
+            )
+        if known_context_mask is not None:
+            agnostic = known_context_mask * image + (1.0 - known_context_mask) * agnostic
+            agnostic_mask = agnostic_mask * (1.0 - known_context_mask)
+
         return {
-            "image": _rgb(person_path, self.size),
-            "agnostic": _rgb(agnostic_path, self.size),
-            "agnostic_mask": _mask(mask_path, self.size),
-            "densepose": _rgb(pose_path, self.size),
-            "garment": _rgb(garment_path, self.size),
+            "image": image,
+            "agnostic": agnostic,
+            "agnostic_mask": agnostic_mask,
+            "densepose": densepose,
+            "garment": garment,
             "garment_mask": cloth_mask,
             "clothing_mask": clothing_mask,
             "person_name": person_name,

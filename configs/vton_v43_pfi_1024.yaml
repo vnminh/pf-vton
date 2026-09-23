@@ -1,0 +1,120 @@
+# V43: PFI trained from scratch (released PFT-XL/2) at full VITON-HD 1024x768.
+#
+#   PYTHONPATH=. python -m vton_ext.pfi_train --config configs/vton_v43_pfi_1024.yaml
+#
+# One run that fuses the V40 -> V41 -> V42 recipe into a single curriculum:
+#   grounding   pure noise dominates; only garment + pose explain the target,
+#               so the model must learn to read the garment (V40 start);
+#   refinement  after the CoRAL gate opens, mass moves to near-clean detail
+#               times with the narrow V41 lag, and the V42 decoded RGB /
+#               high-pass loss ramps in with the same progress.
+#
+# Resolution-dependent choices:
+#   * patch size 2 -> 64x48 = 3072 tokens per stream, 16x16 px per token. This
+#     is the pretrained PFT patch embedding and the SD3/FLUX 1024 standard; the
+#     DINOv3 teacher grid is exactly 64x48. Patch 1 would discard the pretrained
+#     embedding/output layers, and cost ~16x attention per call.
+#   * schedule shift a = 2 (sqrt of 4x the 512 token count), training and
+#     sampling; the detail branch is exempt so it stays near clean.
+#   * pixel settings doubled, token-relative CoRAL settings halved.
+seed: 42
+
+weights:
+  pft: checkpoints/pft-xl_step400k_ema.ckpt
+  vae: checkpoints/sd_ae.ckpt
+  dino: checkpoints/dinov3-vits16-pretrain-lvd1689m
+  init_from: null                    # from scratch: PFT-XL/2 only
+
+data:
+  root: ../high-resolution-viton-zalando-dataset   # native 1024x768
+  pairs_file: ${data.root}/train_fit_pairs.txt
+  test_pairs_file: ${data.root}/train_dev_pairs.txt
+  official_paired_pairs_file: ${data.root}/test_pairs_paired.txt
+  official_unpaired_pairs_file: ${data.root}/test_pairs.txt
+  clothing_labels: [5, 6, 7]
+  num_workers: 8
+  augment: true
+  person_translate_fraction: 0.03
+  person_scale_range: [0.96, 1.04]
+  garment_translate_fraction: 0.05
+  garment_scale_range: [0.94, 1.06]
+  mask_open_px_range: [0, 24]        # 2x the 512 setting
+
+model:
+  image_hw: [1024, 768]
+  latent_hw: [128, 96]
+  patch_size: 2
+  coral_blocks: [8, 12, 16, 20]
+  coral_heads: 4
+
+flow:
+  time_shift: 2.0
+  ltg_std: 0.6
+  ltg_loc: 0.0
+  ltg_scale: 1.0
+  curriculum:
+    # Grounding (V40 start, more pure noise: nothing is learned yet at 1024).
+    start: {pure_noise: 0.60, synchronous: 0.20, detail: 0.00}
+    # Refinement (V41/V42 final mixture); LTG takes the remaining 35%.
+    end: {pure_noise: 0.10, synchronous: 0.15, detail: 0.40}
+    detail_range: [0.75, 0.98]       # actual patch times (detail_unshifted)
+    detail_std: 0.05                 # V41 narrow lag
+    detail_unshifted: true
+    gate_metric: coral_local_mass
+    gate_threshold: 0.40             # V40 opened at 0.41 on the 512 grid
+    gate_min_steps: 3000
+    gate_max_steps: 10000
+    ramp_steps: 6000
+  garment_dropout: 0.10
+
+coral:
+  weight: 0.10
+  entropy_weight: 0.01
+  gaussian_sigma: 0.02               # ~1.3 tokens, as 0.04 was on 32x24
+  min_similarity: 0.20
+  cycle_radius: 0.05                 # ~3.2 tokens, as 0.10 was on 32x24
+
+loss:
+  uncertainty_weight: 0.01
+  clothing_boost: 1.0
+  # V42 decoded detail loss on the full 1024x768 image (no crop).
+  decoded_rgb_weight: 0.5
+  decoded_highpass_weight: 2.0
+  decoded_graphic_boost: 2.0
+  decoded_min_time: 0.65
+  decoded_probability: 0.5
+  decoded_max_images: 1
+  decoded_follow_curriculum: true    # weight = curriculum progress (0 -> 1)
+
+optim:
+  lr: 1.0e-4                     # new embedders / role embeddings
+  pretrained_lr_multiplier: 0.2  # 2e-5 for the full PFT backbone
+  weight_decay: 0.0
+  warmup_steps: 1000
+  min_lr_ratio: 0.1
+  clip_grad_norm: 1.0
+
+train:
+  batch_size: 4
+  gradient_accumulation_steps: 4   # effective batch 16, as V40-V42
+  gradient_checkpointing: true
+  max_steps: 30000
+  ema_decay: 0.0
+  ema_start: 500
+  log_every: 10
+  save_every: 250
+  keep_every: 1000                 # keep every evaluated checkpoint
+  output_dir: logs/vton-v43-pfi-1024
+
+eval:
+  every: 1000
+  at_start: false
+  seed: 12345
+  batch_size: 2
+  indices: [23, 65, 44, 115, 163, 232, 93, 152]
+  mask_open_px: 12
+  p: 0.7
+  n_inner: 2
+  samplers:
+    - {name: euler, nfe: 8}
+    - {name: dual_loop, nfe: 8}
