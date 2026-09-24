@@ -1,0 +1,29 @@
+{
+  "baseline_eval": {
+    "step": 5000,
+    "euler8_mask_l1": 0.1870684176683426,
+    "euler8_cloth_l1": 0.18410877138376236,
+    "dual_loop8_mask_l1": 0.18441952764987946,
+    "dual_loop8_cloth_l1": 0.18249692022800446,
+    "euler25_mask_l1": 0.1927214041352272,
+    "euler25_cloth_l1": 0.19212938100099564
+  },
+  "training_window_4910_5000": {
+    "loss_flow": 0.4423242658004165,
+    "loss_coral": 0.5598768857121468,
+    "coral_local_mass": 0.5203297606110573,
+    "coral_target_mass": 0.0637516715284437,
+    "t_edit_mean": 0.4033141148835421,
+    "curriculum": 1.0,
+    "p_pure_noise": 0.10000000149011612,
+    "p_synchronous": 0.15000000596046448,
+    "p_detail": 0.4000000059604645
+  },
+  "source_checkpoint": "logs/vton-v40-pfi-coral/step0005000-resume.pt",
+  "source_checkpoint_step": 5000,
+  "optimizer_retained": true,
+  "curriculum_state": {
+    "metric_ema": 0.5190847566084851,
+    "ramp_start": 1500
+  }
+}

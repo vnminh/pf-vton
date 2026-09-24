@@ -1,0 +1,212 @@
+{
+  "audit_date": "2026-09-23",
+  "run_path": "/workspace/patch-forcing-vton/logs/vton-v40-pfi-coral",
+  "snapshot_last_training_step": 3520,
+  "snapshot_last_evaluation_step": 3500,
+  "code_sha256_verified_equal_to_server": {
+    "vton_ext/pfi_train.py": "68a0a529c36709fcbfe420cd62b185e62673facaee7fc544d2c4496c23a09233",
+    "vton_ext/pfi_model.py": "036c3b9d9fb4e2f9e8d36688518f05d09714159b8fc453fa653fd47219998d53",
+    "vton_ext/pfi_sample.py": "148febb73a4e630c961d7a02d9b0489693a6c00acec7063f2e7b1c624d93edeb",
+    "vton_ext/coral.py": "770f31f5b89c1517d8830a28eb781c020e3ea70e52103696ede638d4eb0d3583",
+    "patch_flow/timestep_schedules.py": "c58571a520b7ff90a76171fad4e69ec3ec60eb0ea76af38eda47de31968084c5"
+  },
+  "training_windows": [
+    {
+      "from_step_exclusive": 0,
+      "through_step": 100,
+      "log_records": 10,
+      "loss_flow": 0.6943753159046173,
+      "loss_coral": 0.9294830290973186,
+      "coral_local_mass": 0.083899395884946,
+      "coral_target_mass": 0.006568113025277852,
+      "coral_reliable": 0.1669897511508316,
+      "t_edit_mean": 0.21016653402941304,
+      "grad_norm": 2.3442717492580414,
+      "curriculum": 0.0,
+      "p_pure_noise": 0.5,
+      "p_synchronous": 0.20000000298023224,
+      "p_detail": 0.0
+    },
+    {
+      "from_step_exclusive": 400,
+      "through_step": 500,
+      "log_records": 10,
+      "loss_flow": 0.47433420106768603,
+      "loss_coral": 0.7261320436000824,
+      "coral_local_mass": 0.21094954879954458,
+      "coral_target_mass": 0.020509510673582552,
+      "coral_reliable": 0.16553548637777565,
+      "t_edit_mean": 0.19334569571074098,
+      "grad_norm": 0.49693404138088226,
+      "curriculum": 0.0,
+      "p_pure_noise": 0.5,
+      "p_synchronous": 0.20000000298023224,
+      "p_detail": 0.0
+    },
+    {
+      "from_step_exclusive": 1400,
+      "through_step": 1500,
+      "log_records": 10,
+      "loss_flow": 0.40933635845780375,
+      "loss_coral": 0.6042834571003913,
+      "coral_local_mass": 0.4116483659297228,
+      "coral_target_mass": 0.04568023634608835,
+      "coral_reliable": 0.1668351285532117,
+      "t_edit_mean": 0.19427981317508966,
+      "grad_norm": 0.36944888681173327,
+      "curriculum": 0.0,
+      "p_pure_noise": 0.5,
+      "p_synchronous": 0.20000000298023224,
+      "p_detail": 0.0
+    },
+    {
+      "from_step_exclusive": 2400,
+      "through_step": 2500,
+      "log_records": 10,
+      "loss_flow": 0.42577879551798103,
+      "loss_coral": 0.5859238627552986,
+      "coral_local_mass": 0.46048943407833576,
+      "coral_target_mass": 0.053219871455803515,
+      "coral_reliable": 0.16592611144296826,
+      "t_edit_mean": 0.2539406860386953,
+      "grad_norm": 0.32706080824136735,
+      "curriculum": 0.3183333333333333,
+      "p_pure_noise": 0.37266666889190675,
+      "p_synchronous": 0.18408333659172058,
+      "p_detail": 0.12733333706855773
+    },
+    {
+      "from_step_exclusive": 2900,
+      "through_step": 3000,
+      "log_records": 10,
+      "loss_flow": 0.42582254886627197,
+      "loss_coral": 0.578803412169218,
+      "coral_local_mass": 0.4762876983731985,
+      "coral_target_mass": 0.05605449971742928,
+      "coral_reliable": 0.16336670403368772,
+      "t_edit_mean": 0.3071079484932125,
+      "grad_norm": 0.31262646466493604,
+      "curriculum": 0.485,
+      "p_pure_noise": 0.30600000023841856,
+      "p_synchronous": 0.17575000524520873,
+      "p_detail": 0.19400000274181367
+    },
+    {
+      "from_step_exclusive": 3400,
+      "through_step": 3500,
+      "log_records": 10,
+      "loss_flow": 0.43718973856419324,
+      "loss_coral": 0.573456563949585,
+      "coral_local_mass": 0.4907792662829161,
+      "coral_target_mass": 0.058281338517554106,
+      "coral_reliable": 0.1602815800346434,
+      "t_edit_mean": 0.32757141871843487,
+      "grad_norm": 0.2781775712966919,
+      "curriculum": 0.6516666666666666,
+      "p_pure_noise": 0.2393333375453949,
+      "p_synchronous": 0.16741667240858077,
+      "p_detail": 0.2606666713953018
+    }
+  ],
+  "curriculum_gate": {
+    "step": 1500,
+    "coral_local_mass_ema": 0.4115924024923061,
+    "ramp_complete_at": 4500
+  },
+  "cpu_actual_detail_sampler": {
+    "seed": 12345,
+    "examples": 4096,
+    "tokens_per_example": 768,
+    "mean": 0.5303701758384705,
+    "fraction_gt_0_7": 0.25109386444091797,
+    "fraction_gt_0_8": 0.10104051977396011,
+    "fraction_gt_0_9": 0.0194829311221838
+  },
+  "monte_carlo_time_distribution": {
+    "seed": 20260923,
+    "samples_per_component": 1000000,
+    "components": {
+      "noise": {
+        "mean": 0.0,
+        "p_gt_0.7": 0.0,
+        "p_gt_0.8": 0.0,
+        "p_gt_0.9": 0.0,
+        "p_gt_0.95": 0.0
+      },
+      "sync": {
+        "mean": 0.500053361098058,
+        "p_gt_0.7": 0.198354,
+        "p_gt_0.8": 0.082816,
+        "p_gt_0.9": 0.014039,
+        "p_gt_0.95": 0.001605
+      },
+      "ltg": {
+        "mean": 0.31592869302180976,
+        "p_gt_0.7": 0.035387,
+        "p_gt_0.8": 0.008539,
+        "p_gt_0.9": 0.000583,
+        "p_gt_0.95": 2.2e-05
+      },
+      "detail": {
+        "mean": 0.5315402865313702,
+        "p_gt_0.7": 0.253989,
+        "p_gt_0.8": 0.102389,
+        "p_gt_0.9": 0.019983,
+        "p_gt_0.95": 0.002725
+      }
+    },
+    "mixtures": {
+      "start": {
+        "mean": 0.194789,
+        "p_gt_0.7": 0.050287,
+        "p_gt_0.8": 0.019125,
+        "p_gt_0.9": 0.002983,
+        "p_gt_0.95": 0.000328
+      },
+      "step3500": {
+        "mean": 0.330396,
+        "p_gt_0.7": 0.112585,
+        "p_gt_0.8": 0.043953,
+        "p_gt_0.9": 0.007863,
+        "p_gt_0.95": 0.001002
+      },
+      "end": {
+        "mean": 0.398199,
+        "p_gt_0.7": 0.143734,
+        "p_gt_0.8": 0.056367,
+        "p_gt_0.9": 0.010303,
+        "p_gt_0.95": 0.001338
+      }
+    }
+  },
+  "split": {
+    "fit_pairs": 11391,
+    "dev_pairs": 256,
+    "overlapping_person_filenames": 0,
+    "overlapping_garment_filenames": 0,
+    "visually_duplicate_garments_checked": false
+  },
+  "preview_indices": [
+    23,
+    65,
+    44,
+    115,
+    163,
+    232,
+    93,
+    152
+  ],
+  "prior_vae_audit": {
+    "path": "outputs/vae-logo-audit",
+    "num_examples": 12,
+    "mean_clothing_l1": 0.04028408617402116,
+    "mean_highpass_l1": 0.03162672254256904,
+    "not_recomputed": true
+  },
+  "limitations": [
+    "Only existing eight paired dev previews were evaluated; no new GPU model evaluation.",
+    "No quantitative OCR or uncertainty-error calibration measurements are available.",
+    "Crop images originate from saved JPEG previews; no precision image metrics were computed from them.",
+    "VAE audit is pre-existing and has different case weighting from current generation metrics."
+  ]
+}
