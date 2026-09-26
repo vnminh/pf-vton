@@ -6,6 +6,12 @@ VITON-HD images with patch forcing, a DINOv3 correspondence teacher, and a
 curriculum that adds decoded RGB/detail supervision. The configuration is
 [`configs/vton_v43_pfi_1024.yaml`](../configs/vton_v43_pfi_1024.yaml).
 
+For the existing V42 model, use the **fine-tuning recipe** below instead of
+starting the VTON conditioning again. The reviewed parent is V42 step 16000;
+its full optimizer checkpoint is preserved separately on the training server.
+See [the high-resolution review](../docs/vton_v43_high_resolution_review.md)
+for the choices and measured memory limits.
+
 ## 1. Environment and checkpoints
 
 Use Python 3.12 and a CUDA/PyTorch installation appropriate for your GPU. The
@@ -75,6 +81,8 @@ from pathlib import Path
 from random import Random
 
 root = Path('../high-resolution-viton-zalando-dataset')
+for name in ('train_fit_pairs.txt', 'train_dev_pairs.txt'):
+    assert not (root / name).exists(), f'Keep the existing split: {root / name}'
 rows = [line for line in (root / 'train_pairs.txt').read_text().splitlines() if line.strip()]
 assert len(rows) > 256, 'Expected the full VITON-HD training pair list'
 dev = set(Random(42).sample(range(len(rows)), 256))
@@ -144,3 +152,55 @@ pretrained artifacts above. `--resume` should only be used for a V43
 `latest.pt` from the same architecture and resolution. Logs and checkpoints
 stay under `logs/`, which is ignored by Git; back up wanted checkpoints
 separately from the source repository.
+
+## 4. Recommended continuation from V42
+
+On the current server, `checkpoints/pfi-safety/v42-step16000.pt` holds the
+weights extracted from the last saved V42 checkpoint. Copy this file when
+moving machines; it is not included in Git or the public downloads.
+
+For a GPU with enough memory for full-image decoded supervision:
+
+```bash
+PYTHONPATH=. python -m vton_ext.pfi_train \
+  --config configs/vton_v43_pfi_1024_finetune.yaml
+```
+
+For the current 24 GB RTX 3090:
+
+```bash
+PYTHONPATH=. python -m vton_ext.pfi_train \
+  --config configs/vton_v43_pfi_1024_24gb.yaml
+```
+
+Both recipes use 1024 × 768 inputs and the full 3,072-token person and garment
+streams. The 24 GB variant uses smaller microbatches and a jittered 512 × 384
+clothing crop for decoded loss, with 32 pixels of decoder context around it.
+It evaluates whole images and accumulates an effective batch of 16. Cropped
+decoder supervision is an approximation because decoder context is limited;
+it is not identical to full-image decoded loss.
+
+The fine-tuning pilot runs 1,000 **new** optimizer steps with a 10,000-step LR
+horizon, 100 warmup steps, and a backbone peak LR of `5e-6`. It retains the
+learned time-mixture probabilities and uses a new optimizer. Step 0, 500 and
+1000 previews compare Euler 8, shifted dual-loop 8, and unshifted dual-loop 8.
+Each uses eight person-denoiser calls (`cfg=1`). Evaluation noise is fixed per
+case and does not change with evaluation batch size.
+
+The server launcher [`run_pfi_v43_finetune.sh`](../scripts/run_pfi_v43_finetune.sh)
+resumes the 24 GB run automatically if its `latest.pt` exists. Inspect it with
+`supervisorctl status pfi-v43-1024` and
+`tail -f logs/vton-v43-pfi-1024-24gb.log`. To continue past the pilot, increase
+`train.stop_at_step` without shortening `train.max_steps`.
+
+Before changing microbatch size or enabling full-image decoded loss, run the
+memory probe; it forces the decoded objective on and tests backward,
+accumulated gradients, and resident Adam state across two updates:
+
+```bash
+PYTHONPATH=. python scripts/check_pfi_high_resolution.py \
+  --config configs/vton_v43_pfi_1024_24gb.yaml \
+  --output logs/v43-memory-probe.json
+```
+
+It uses an optimizer learning rate of zero and saves no model checkpoint.

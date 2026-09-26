@@ -168,7 +168,9 @@ def run(args):
     if args.num_samples:
         indices = indices[:args.num_samples]
     preview_set = set(int(i) for i in cfg.eval.indices)
-    if args.profile_count <= 0 or args.profile_count >= len(indices):
+    if args.profile_count < 0:
+        profile_indices = []
+    elif args.profile_count == 0 or args.profile_count >= len(indices):
         profile_indices = list(indices)
     else:
         featured = [i for i in indices if i in preview_set]
@@ -313,7 +315,7 @@ def main():
     p.add_argument("--seed", type=int, default=12345)
     p.add_argument("--num-samples", type=int, default=0)
     p.add_argument("--profile-count", type=int, default=64,
-                   help="Number of cases for expensive teacher/rollout time profiles; 0 profiles all")
+                   help="Number of cases for expensive teacher/rollout time profiles; 0 profiles all, -1 skips")
     p.add_argument("--indices", type=int, nargs="+")
     p.add_argument("--samplers", nargs="+", default=["euler:8", "dual_loop:8", "euler:25", "euler:50"])
     p.add_argument("--no-images", action="store_true")

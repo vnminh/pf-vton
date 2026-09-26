@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#071323">
+  <meta name="description" content="Sơ đồ tương tác kiến trúc PFI-VTON với shape tensor ở 512×384 và 1024×768.">
+  <title>PFI-VTON · Architecture Atlas</title>
+  <link rel="stylesheet" href="assets/pfi-vton-architecture.css">
+  <script src="assets/pfi-vton-architecture.js" defer></script>
+</head>
+<body>
+  <div class="ambient ambient-one" aria-hidden="true"></div>
+  <div class="ambient ambient-two" aria-hidden="true"></div>
+  <main class="shell">
+    <header class="hero">
+      <div class="hero-top"><a class="brand" href="index.html"><span class="brand-mark">PF</span><span>PATCH FORCING <b>VTON</b></span></a><a class="doc-link" href="pfi_vton_architecture_vi.md">Đọc giải thích đầy đủ <span aria-hidden="true">↗</span></a></div>
+      <div class="eyebrow"><span class="pulse"></span> INTERACTIVE ARCHITECTURE · CODE-ALIGNED SHAPES</div>
+      <h1>Một backbone.<br><em>Hai luồng token.</em></h1>
+      <p class="lede">Khám phá cách PFT-XL/2 biến thành mô hình thử đồ: person query đọc K/V áo, còn áo được xử lý một lần và cache qua các bước sampling. Chọn cấu hình để xem shape thực của từng đoạn.</p>
+      <div class="legend" aria-label="Chú giải"><span><i class="legend-dot base"></i> Giữ từ PFT</span><span><i class="legend-dot changed"></i> Mở rộng cho VTON</span><span><i class="legend-dot frozen"></i> Mô hình đóng băng</span><span><i class="legend-dot train"></i> Chỉ khi train</span></div>
+    </header>
+
+    <section class="controls" aria-labelledby="controls-title">
+      <div class="section-heading"><div><span class="kicker">CẤU HÌNH SƠ ĐỒ</span><h2 id="controls-title">Thay đầu vào, xem luồng tensor</h2></div><span class="control-note" id="recipe-hint">Shape [B, C, H, W] · recipe V45</span></div>
+      <div class="control-grid">
+        <label class="control"><span>Độ phân giải</span><select id="resolution"><option value="1024">1024 × 768</option><option value="512">512 × 384</option></select></label>
+        <label class="control"><span>Batch size</span><select id="batch"><option value="1">B = 1</option><option value="4">B = 4</option></select></label>
+        <fieldset class="mode-control"><legend>Chế độ</legend><label><input type="radio" name="mode" value="infer" checked><span>Inference</span></label><label><input type="radio" name="mode" value="train"><span>Training</span></label></fieldset>
+        <label class="control inference-only"><span>Sampler</span><select id="sampler"><option value="dual_loop">Dual-loop · uncertainty</option><option value="euler">Euler</option><option value="look_ahead">Look-ahead</option></select></label>
+        <label class="control inference-only"><span>NFE</span><select id="nfe"><option value="4">4 evaluations</option><option value="8" selected>8 evaluations</option><option value="16">16 evaluations</option></select></label>
+        <label class="control inference-only"><span>Garment CFG</span><select id="cfg"><option value="1">1.0 · không guidance</option><option value="2">2.0 · có guidance</option></select></label>
+      </div>
+    </section>
+
+    <section class="metrics" aria-label="Kích thước chính">
+      <div class="metric"><span>PIXEL / TOKEN</span><strong>16 × 16</strong><small>VAE ÷ 8 · patch ÷ 2</small></div>
+      <div class="metric"><span>TOKEN / LUỒNG</span><strong id="metric-tokens">3.072</strong><small id="metric-grid">64 × 48 grid</small></div>
+      <div class="metric"><span>PERSON → KEYS</span><strong id="metric-keys">3.072 → 6.144</strong><small>person + garment K/V</small></div>
+      <div class="metric"><span id="metric-run-label">PERSON CALLS / GARMENT CACHES</span><strong id="metric-run">8 / 1</strong><small id="metric-run-note">8 NFE · CFG 1</small></div>
+    </section>
+
+    <div class="workbench">
+      <section class="atlas" aria-label="Sơ đồ luồng kiến trúc">
+        <div class="phase-title"><span>01</span><div><h2>Ảnh và điều kiện</h2><p>5 tensor có sẵn tại inference; ảnh target chỉ xuất hiện khi train.</p></div></div>
+        <div class="input-grid">
+          <button class="node changed" data-node="personInput"><span class="node-top"><span class="node-icon">◧</span><span class="node-tag">VTON INPUT</span></span><strong>Người agnostic</strong><span class="node-desc">Ảnh giữ nền + mask vùng cần mặc áo</span><code data-shape="personInput"></code></button>
+          <button class="node changed" data-node="poseInput"><span class="node-top"><span class="node-icon">⌁</span><span class="node-tag">VTON INPUT</span></span><strong>DensePose</strong><span class="node-desc">Thông tin tư thế người</span><code data-shape="poseInput"></code></button>
+          <button class="node changed" data-node="garmentInput"><span class="node-top"><span class="node-icon">▧</span><span class="node-tag">VTON INPUT</span></span><strong>Áo tham chiếu</strong><span class="node-desc">Garment RGB + mask áo</span><code data-shape="garmentInput"></code></button>
+        </div>
+        <div class="connector"><span>↓</span><span>FROZEN VAE ENCODER · /8 MỖI CHIỀU</span><span>↓</span></div>
+        <div class="input-grid latent-grid">
+          <button class="node frozen" data-node="known"><span class="node-top"><span class="node-icon">▤</span><span class="node-tag">FROZEN VAE</span></span><strong>Agnostic latent</strong><span class="node-desc">Known context; mask latent được nối sau</span><code data-shape="known"></code></button>
+          <button class="node changed" data-node="cond"><span class="node-top"><span class="node-icon">⊕</span><span class="node-tag">NEW PROJECTION</span></span><strong>Điều kiện 9 kênh</strong><span class="node-desc">agnostic 4 + mask 1 + pose 4</span><code data-shape="cond"></code></button>
+          <button class="node changed" data-node="garmentLatent"><span class="node-top"><span class="node-icon">▥</span><span class="node-tag">NEW PROJECTION</span></span><strong>Garment 5 kênh</strong><span class="node-desc">garment latent 4 + mask 1</span><code data-shape="garmentLatent"></code></button>
+        </div>
+
+        <div class="phase-title spaced"><span>02</span><div><h2>Patch embedding và vai trò</h2><p>Patch latent 2×2; mỗi luồng có cùng lưới token.</p></div></div>
+        <div class="streams">
+          <div class="stream-label person-label"><span class="stream-dot"></span> PERSON STREAM <small>EDIT / KNOWN</small></div>
+          <div class="stream-label garment-label"><span class="stream-dot"></span> GARMENT STREAM <small>t = 1 · CLEAN</small></div>
+          <button class="node base person-node" data-node="personTokens"><span class="node-top"><span class="node-icon">▦</span><span class="node-tag">PFT WEIGHTS + VTON COND</span></span><strong>Person tokens</strong><span class="node-desc">x_embedder + cond_embedder + pos + role</span><code data-shape="personTokens"></code></button>
+          <button class="node changed garment-node" data-node="garmentTokens"><span class="node-top"><span class="node-icon">▦</span><span class="node-tag">SHARED BACKBONE</span></span><strong>Garment tokens</strong><span class="node-desc">garment_embedder + pos + role</span><code data-shape="garmentTokens"></code></button>
+        </div>
+        <button class="pos-strip" data-node="position"><span class="pos-icon">⌗</span><span><b>Bảng vị trí chữ nhật</b> · PFT 16×16 nội suy bicubic → <b id="pos-grid">64×48</b>; V45 fine-tune</span><code data-shape="position"></code></button>
+        <button class="pos-strip time-strip" data-node="timeMask"><span class="pos-icon">◷</span><span><b>Patch-wise time + edit mask</b> · EDIT có tᵢ riêng; KNOWN và garment luôn t=1</span><code data-shape="timeMask"></code></button>
+        <div class="curriculum train-only" aria-label="Phân phối thời gian của các patch được chỉnh sửa">
+          <div class="curriculum-head"><span><b>PHÂN PHỐI THỜI GIAN KHI TRAIN</b><small id="curriculum-note">V45 · fine-tune từ hỗn hợp cuối</small></span><span id="curriculum-percent">100%</span></div>
+          <label class="curriculum-slider"><span>Grounding</span><input id="curriculum-progress" type="range" min="0" max="100" value="100" aria-label="Tiến độ curriculum sau CoRAL gate"><span>Refinement</span></label>
+          <div class="distribution" role="img" aria-label="Tỷ lệ bốn nhánh thời gian"><span id="bar-noise" class="dist-noise"></span><span id="bar-sync" class="dist-sync"></span><span id="bar-detail" class="dist-detail"></span><span id="bar-ltg" class="dist-ltg"></span></div>
+          <div class="distribution-legend"><span><i class="dist-noise"></i>Pure noise <b id="pct-noise">10%</b></span><span><i class="dist-sync"></i>Synchronous <b id="pct-sync">15%</b></span><span><i class="dist-detail"></i>Detail <b id="pct-detail">40%</b></span><span><i class="dist-ltg"></i>LTG <b id="pct-ltg">35%</b></span></div>
+        </div>
+
+        <div class="phase-title spaced"><span>03</span><div><h2>28 block, dùng chung trọng số</h2><p>Hai đường tính toán trong cùng một DiT block. Chiều đọc áo chỉ đi một hướng.</p></div></div>
+        <div class="backbone">
+          <div class="backbone-header"><span class="repeat">× 28 BLOCKS</span><span>width 1152 · 16 heads · head dim 72 · adaLN</span></div>
+          <div class="block-columns">
+            <button class="node base" data-node="personAttention"><span class="node-top"><span class="node-icon">↘</span><span class="node-tag">PFT QKV · VTON ROUTING</span></span><strong>Person attention</strong><span class="node-desc">Q person → K/V person + garment</span><code data-shape="personAttention"></code></button>
+            <button class="node changed" data-node="garmentAttention"><span class="node-top"><span class="node-icon">⟲</span><span class="node-tag">SHARED WEIGHTS · NEW PATH</span></span><strong>Garment self-attention</strong><span class="node-desc">Q/K/V garment → cập nhật chỉ trong áo</span><code data-shape="garmentAttention"></code></button>
+          </div>
+          <div class="kv-bridge"><span class="bridge-arrow" aria-hidden="true">←</span><button class="bridge-label" data-node="kvCache"><b>Garment K/V cache</b><code data-shape="kvCache"></code><small>mỗi block → person đọc · không có person → garment</small></button></div>
+          <div class="block-footer"><span>MLP + residual · cùng <code>blocks[ℓ]</code> cho cả hai luồng</span><span>ℓ = 0…27</span></div>
+        </div>
+        <button class="coral-strip train-only" data-node="coral"><span class="coral-symbol">◎</span><span><b>CoRAL readout</b> · block 8, 12, 16, 20 · 4 head đầu · softmax trên garment keys</span><code data-shape="coral"></code></button>
+
+        <div class="phase-title spaced"><span>04</span><div><h2>Output và kết quả</h2><p>Chỉ person tokens đi qua final layer; latent áo không có ảnh output riêng.</p></div></div>
+        <div class="output-grid">
+          <button class="node base" data-node="head"><span class="node-top"><span class="node-icon">↧</span><span class="node-tag">PFT FINAL LAYER</span></span><strong>Velocity + uncertainty</strong><span class="node-desc">20 chiều/token → unpatchify 5 kênh</span><code data-shape="head"></code></button>
+          <button class="node changed infer-only" data-node="samplerNode"><span class="node-top"><span class="node-icon">◴</span><span class="node-tag">VTON SAMPLING</span></span><strong id="sampler-title">Dual-loop · masked</strong><span class="node-desc">Chỉ tích phân patch EDIT; KNOWN giữ nguyên</span><code data-shape="samplerNode"></code></button>
+          <button class="node frozen infer-only" data-node="result"><span class="node-top"><span class="node-icon">◩</span><span class="node-tag">VAE DECODE + COMPOSITE</span></span><strong>Ảnh try-on</strong><span class="node-desc">Giữ pixel quan sát được ngoài mask</span><code data-shape="result"></code></button>
+          <button class="node train train-only" data-node="target"><span class="node-top"><span class="node-icon">◈</span><span class="node-tag">TRAIN ONLY</span></span><strong>Ảnh target + flow target</strong><span class="node-desc">x₁ = E(I); u = x₁ − ε</span><code data-shape="target"></code></button>
+          <button class="node train train-only" data-node="dino"><span class="node-top"><span class="node-icon">✳</span><span class="node-tag">FROZEN TEACHER</span></span><strong>DINOv3 correspondence</strong><span class="node-desc">target person ↔ garment similarity</span><code data-shape="dino"></code></button>
+          <button class="node train train-only" data-node="loss"><span class="node-top"><span class="node-icon">∑</span><span class="node-tag">VTON OBJECTIVES</span></span><strong id="loss-title">Flow + NLL + CoRAL + RGB</strong><span class="node-desc" id="loss-desc">decoded RGB/high-pass trên mẫu chọn</span><code data-shape="loss"></code></button>
+        </div>
+        <div class="footnote" id="atlas-note">Shape được tính từ cấu hình và phép toán trong source; sơ đồ không chạy checkpoint. Với CFG ≠ 1, số person call thực tế gấp đôi NFE.</div>
+      </section>
+
+      <aside class="inspector" aria-live="polite" aria-label="Chi tiết khối được chọn">
+        <div class="inspector-head"><span class="kicker">BLOCK INSPECTOR</span><span class="inspector-index" id="inspector-index">01 / 15</span></div>
+        <div class="inspector-graphic" aria-hidden="true"><span class="inspector-orbit orbit-one"></span><span class="inspector-orbit orbit-two"></span><span class="inspector-glyph" id="inspector-glyph">▦</span></div>
+        <span class="inspector-tag" id="inspector-tag">PFT WEIGHTS + VTON COND</span>
+        <h2 id="inspector-title">Person tokens</h2>
+        <p id="inspector-desc"></p>
+        <div class="io-list"><div><span>INPUT</span><code id="inspector-input"></code></div><div class="io-arrow">↓</div><div><span>OUTPUT</span><code id="inspector-output"></code></div></div>
+        <div class="inspector-explain"><span>CHI TIẾT</span><p id="inspector-detail"></p></div>
+        <div class="inspector-formula"><span>PHÉP TOÁN</span><code id="inspector-formula"></code></div>
+        <a class="source-link" id="inspector-source" href="#">Xem source <span aria-hidden="true">↗</span></a>
+      </aside>
+    </div>
+    <footer><span>PFI-VTON · kiến trúc từ code trong repository</span><a href="pfi_vton_architecture_vi.md">Tài liệu Markdown ↗</a></footer>
+  </main>
+</body>
+</html>

@@ -1,0 +1,138 @@
+# V45: 1024x768 fine-tune, V44 recipe plus four fixes from the V44 step-1250 review.
+#
+#   PYTHONPATH=. python -m vton_ext.pfi_train --config configs/vton_v45_pfi_1024.yaml
+#
+# V44 (5e-6 backbone LR) was flat: flow loss 0.51 -> 0.50 and coral_local_mass
+# ~0.59 over 1250 steps. Previews showed the same garment errors at step 0 and
+# 1000 (FILA halter -> tube top, garbled letters) and a bright halo along the
+# whole agnostic outline. Changes, each measured on the 8 dev cases (V44 w.):
+#  1. Seam correction at inference (eval.seam_px 8): observed-minus-decoded
+#     offset from known pixels only, faded in over the mask border. Border-band
+#     L1 0.060 -> 0.056; outward feathering undid the gain, so it is off.
+#  2. Backbone LR 2e-5 (V42's peak at 512), new embedders 4e-5, 200 warmup.
+#  3. Garment branch: CoRAL sigma 0.04 -> 0.02 image-relative, i.e. the same
+#     tolerance in tokens as at 512 (the 1024 grid is twice as fine). Garment
+#     CFG 2 is tracked in eval next to CFG 1; at V44 it raised cloth L1 0.174 ->
+#     0.225 but fixed garment coverage in FILA, so previews decide the default.
+#  4. Positional table trainable, initialised from the interpolated PFT table.
+#     A native 64x48 sin-cos table (model.pos_embed: sincos) was tried first:
+#     positions 0..63 lie outside the pretrained 0..15 range and V44 weights
+#     produce noise with it (cloth L1 0.51), i.e. it would restart training.
+# Sampling uses time_shift 1 (better than 2 at every V44 eval); training keeps 2.
+seed: 42
+
+weights:
+  pft: checkpoints/pft-xl_step400k_ema.ckpt    # needed for the position table
+  vae: checkpoints/sd_ae.ckpt
+  dino: checkpoints/dinov3-vits16-pretrain-lvd1689m
+  init_from: checkpoints/pfi-safety/v44-step1250.pt   # weights only (V42 -> V43 pilot -> V44)
+
+data:
+  root: ../high-resolution-viton-zalando-dataset   # native 1024x768
+  pairs_file: ${data.root}/train_fit_pairs.txt
+  test_pairs_file: ${data.root}/train_dev_pairs.txt
+  official_paired_pairs_file: ${data.root}/test_pairs_paired.txt
+  official_unpaired_pairs_file: ${data.root}/test_pairs.txt
+  clothing_labels: [5, 6, 7]
+  num_workers: 12
+  augment: true
+  person_translate_fraction: 0.03
+  person_scale_range: [0.96, 1.04]
+  garment_translate_fraction: 0.05
+  garment_scale_range: [0.94, 1.06]
+  mask_open_px_range: [0, 24]        # 2x the 512 setting
+
+model:
+  image_hw: [1024, 768]
+  latent_hw: [128, 96]
+  patch_size: 2
+  coral_blocks: [8, 12, 16, 20]
+  coral_heads: 4
+  pos_embed: interpolate
+  pos_embed_trainable: true
+
+flow:
+  time_shift: 2.0
+  ltg_std: 0.6
+  ltg_loc: 0.0
+  ltg_scale: 1.0
+  curriculum:
+    # V42's final mixture from the start: the garment is already read.
+    start: {pure_noise: 0.10, synchronous: 0.15, detail: 0.40}
+    end: {pure_noise: 0.10, synchronous: 0.15, detail: 0.40}
+    detail_range: [0.75, 0.98]
+    detail_std: 0.05
+    detail_unshifted: true
+    gate_metric: coral_local_mass
+    gate_threshold: 0.40
+    gate_min_steps: 0
+    gate_max_steps: 0
+    ramp_steps: 1
+  garment_dropout: 0.10
+
+coral:
+  weight: 0.10
+  entropy_weight: 0.01
+  gaussian_sigma: 0.02               # same token tolerance as sigma 0.04 at 512
+  min_similarity: 0.20
+  cycle_radius: 0.10
+  checkpoint_loss: true
+
+loss:
+  uncertainty_weight: 0.01
+  clothing_boost: 1.0
+  # V42 decoded detail loss, full 1024x768 image (no crop), V42 probability.
+  decoded_rgb_weight: 0.5
+  decoded_highpass_weight: 2.0
+  decoded_graphic_boost: 2.0
+  decoded_min_time: 0.65
+  decoded_probability: 0.5
+  decoded_max_images: 1
+  decoded_follow_curriculum: false
+  decoded_checkpoint: true           # same loss, recompute decoder activations
+  decoded_crop_latent: null
+
+optim:
+  lr: 4.0e-5                     # new embedders
+  pretrained_lr_multiplier: 0.5  # 2e-5 backbone (V42 peak); V44's 5e-6 did not move the loss
+  weight_decay: 0.0
+  warmup_steps: 200
+  min_lr_ratio: 0.1
+  clip_grad_norm: 1.0
+
+train:
+  batch_size: 4                    # set from the A6000 memory probe
+  gradient_accumulation_steps: 4   # effective batch 16, as V40-V42
+  gradient_checkpointing: true
+  max_steps: 10000
+  ema_decay: 0.0
+  ema_start: 500
+  log_every: 10
+  save_every: 250                  # latest.pt: ~8 GB full state (+8 GB while saving)
+  # Disk (81 GB): inputs ~11 GB, env ~6 GB, latest 16 GB peak. Snapshots are
+  # bf16 weights (1.35 GB), one per evaluation, newest 16 kept (22 GB), and are
+  # skipped rather than risk the resumable latest.pt when free space < 20 GB.
+  keep_every: 500
+  keep_dtype: bf16
+  keep_last: 12
+  min_free_gb: 20
+  output_dir: logs/vton-v45-pfi-1024
+
+eval:
+  every: 500
+  at_start: true                   # step 0 = V44 step-1250 weights: the baseline to beat
+  seed: 12345
+  batch_size: 2
+  indices: [23, 65, 44, 115, 163, 232, 93, 152]
+  mask_open_px: 12
+  p: 0.7
+  n_inner: 2
+  time_shift: 1.0                  # pfi_sample CLI default
+  seam_px: 8.0
+  feather_px: 0.0
+  cfg_scale: 1.0                   # pfi_sample CLI default until previews favour CFG 2
+  cfg_interval: [0.0, 1.0]
+  samplers:
+    - {name: dual_loop, nfe: 8, time_shift: 1.0}
+    - {name: dual_loop, nfe: 8, time_shift: 1.0, cfg: 2.0}
+    - {name: dual_loop, nfe: 8}

@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from patch_flow.models.pf_transformer import PatchForcingDiT, pf_modulate
-from vton_ext.utils import extract_state_dict, rectangular_pos_from_square
+from vton_ext.utils import extract_state_dict, rectangular_pos_from_square, sincos_pos_embed
 
 
 ROLE_EDIT, ROLE_KNOWN, ROLE_GARMENT = 0, 1, 2
@@ -48,6 +48,8 @@ class VTONInpaintDiT(PatchForcingDiT):
         coral_blocks: Sequence[int] = (8, 12, 16, 20),
         coral_heads: int = 4,
         num_classes: int = 1000,
+        pos_embed: str = "interpolate",
+        pos_embed_trainable: bool = False,
     ):
         super().__init__(
             input_size=32,
@@ -69,12 +71,21 @@ class VTONInpaintDiT(PatchForcingDiT):
         # 1.0 = none. Set from cfg.flow.time_shift; used by training and samplers.
         self.time_shift = 1.0
         self.num_classes_ = num_classes
+        # "interpolate": bicubic-resize the square pretrained table (all tokens
+        # inside its 16x16 position range); "sincos": native table for this grid.
+        if pos_embed not in ("interpolate", "sincos"):
+            raise ValueError("pos_embed must be 'interpolate' or 'sincos'")
+        self.pos_embed_mode = pos_embed
         self.gradient_checkpointing = False
 
         # Rectangular positions (initialised from the square pretrained table in
         # load_pretrained_pft). Garment tokens share them; the role embedding
         # tells the two streams apart.
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_tokens, hidden_size), requires_grad=False)
+        # Trainable: starts from that table, so outputs are unchanged at step 0,
+        # but fine-tuning can separate neighbouring tokens that interpolation
+        # squeezed together (4x at 1024x768 from the 16x16 table).
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_tokens, hidden_size),
+                                      requires_grad=bool(pos_embed_trainable))
         self.cond_embedder = nn.Conv2d(cond_channels, hidden_size, patch_size, patch_size)
         self.garment_embedder = nn.Conv2d(garment_channels, hidden_size, patch_size, patch_size)
         self.role_token = nn.Parameter(torch.zeros(3, hidden_size))
@@ -91,7 +102,10 @@ class VTONInpaintDiT(PatchForcingDiT):
         compatible = {k: v for k, v in state.items() if k in own and own[k].shape == v.shape}
         result = self.load_state_dict(compatible, strict=False)
         with torch.no_grad():
-            self.pos_embed.copy_(rectangular_pos_from_square(source_pos, self.token_hw))
+            if self.pos_embed_mode == "sincos":
+                self.pos_embed.copy_(sincos_pos_embed(self.pos_embed.shape[-1], self.token_hw))
+            else:
+                self.pos_embed.copy_(rectangular_pos_from_square(source_pos, self.token_hw))
             self.init_garment_embedder()
         return {"loaded": len(compatible), "missing": list(result.missing_keys)}
 
@@ -99,9 +113,9 @@ class VTONInpaintDiT(PatchForcingDiT):
         """Load a PFI checkpoint trained at another resolution (weights only).
 
         Every parameter is resolution-independent except the fixed position
-        table, which is re-derived from the square pretrained PFT table exactly
-        as at the source resolution (position interpolation), so the source and
-        target models agree on the image-relative coordinate of every token.
+        table, which is re-derived for the target grid by load_pretrained_pft
+        (``pos_embed`` mode). With "interpolate" the source and target models
+        agree on the image-relative coordinate of every token.
         Call after load_pretrained_pft.
         """
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)

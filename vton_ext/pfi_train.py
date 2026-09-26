@@ -16,6 +16,7 @@ import argparse
 import copy
 import json
 import math
+import shutil
 import time
 from pathlib import Path
 
@@ -51,6 +52,8 @@ def build_model(cfg, load_pretrained: bool = True) -> VTONInpaintDiT:
         patch_size=int(m.patch_size),
         coral_blocks=list(m.coral_blocks),
         coral_heads=int(m.coral_heads),
+        pos_embed=str(m.get("pos_embed", "interpolate")),
+        pos_embed_trainable=bool(m.get("pos_embed_trainable", False)),
     )
     model.time_shift = float(cfg.flow.get("time_shift", 1.0))
     if load_pretrained:
@@ -61,6 +64,26 @@ def build_model(cfg, load_pretrained: bool = True) -> VTONInpaintDiT:
             report = model.load_weights_any_resolution(init_from)
             print(f"initialised from {init_from}: {report}")
     return model
+
+
+def validate_config(cfg):
+    image_hw, latent_hw = tuple(cfg.model.image_hw), tuple(cfg.model.latent_hw)
+    patch = int(cfg.model.patch_size)
+    if len(image_hw) != 2 or len(latent_hw) != 2 or patch <= 0:
+        raise ValueError("Expected two image/latent dimensions and a positive patch size")
+    if any(i <= 0 or i % 8 or i // 8 != l or l % patch for i, l in zip(image_hw, latent_hw)):
+        raise ValueError("image_hw must be 8 * latent_hw; latent dimensions must divide by patch_size")
+    if int(cfg.train.batch_size) < 1 or int(cfg.train.gradient_accumulation_steps) < 1:
+        raise ValueError("Training batch size and accumulation must be positive")
+
+
+def resolve_resume(resume, output_dir):
+    if resume is None:
+        return None
+    path = Path(output_dir) / "latest.pt" if resume == "auto" else Path(resume)
+    if not path.is_file():
+        raise FileNotFoundError(f"Requested resume checkpoint does not exist: {path}")
+    return path
 
 
 # ------------------------------------------------------------------- times
@@ -112,6 +135,12 @@ class EditTimeSampler:
         # exists to cover near-clean refinement in absolute terms, so it can be
         # exempted: its detail_range is then the actual patch-time range.
         self.detail_unshifted = bool(c.get("detail_unshifted", False))
+        # Optional coarse-to-fine drift of the logit-normal location used by the
+        # synchronous and LTG branches: ltg_loc_start early (t near 0, global
+        # structure) -> ltg_loc_end once the ramp completes (t near 1, detail).
+        loc = f.ltg_loc
+        self.loc_start = float(c.get("ltg_loc_start", loc))
+        self.loc_end = float(c.get("ltg_loc_end", loc))
         self.metric_ema = None
         self.ramp_start = None
 
@@ -133,6 +162,9 @@ class EditTimeSampler:
     def probabilities(self, step: int) -> torch.Tensor:
         return torch.lerp(self.start, self.end, self.progress(step))
 
+    def ltg_loc(self, step: int) -> float:
+        return self.loc_start + (self.loc_end - self.loc_start) * self.progress(step)
+
     def state_dict(self) -> dict:
         return {"metric_ema": self.metric_ema, "ramp_start": self.ramp_start}
 
@@ -147,6 +179,7 @@ class EditTimeSampler:
         sync = (u >= p_noise) & (u < p_noise + p_sync)
         detail = (u >= p_noise + p_sync) & (u < p_noise + p_sync + p_detail)
 
+        self.ltg.loc = self.ltg_loc(step)
         t_bar = self.ltg.get_t_bar(b, device=device)
         lo, hi = self.detail_range
         t_bar = torch.where(detail, lo + (hi - lo) * torch.rand(b, device=device), t_bar)
@@ -215,6 +248,10 @@ def decoded_detail_loss(vae, endpoint, target, clothing_mask, edit_mask, cfg, se
         return zero, {"loss_decoded_rgb": zero, "loss_decoded_highpass": zero,
                       "loss_decoded_total": zero}
     with torch.autocast(endpoint.device.type, enabled=False):
+        def decode(z):
+            return decode_latents_with_grad(
+                vae, z, checkpoint_decoder=bool(cfg.loss.get("decoded_checkpoint", False))
+            ).float()
         z = endpoint[selected].float()
         truth = target[selected].float()
         cloth = clothing_mask[selected].float()
@@ -225,7 +262,7 @@ def decoded_detail_loss(vae, endpoint, target, clothing_mask, edit_mask, cfg, se
             preds, truths, cloths, edits, valids = [], [], [], [], []
             for i, (inner, outer) in enumerate(_decode_windows(z, cloth, crop, margin)):
                 oy0, oy1, ox0, ox1 = outer
-                pred = decode_latents_with_grad(vae, z[i:i + 1, :, oy0:oy1, ox0:ox1]).float()
+                pred = decode(z[i:i + 1, :, oy0:oy1, ox0:ox1])
                 sl = (slice(None), slice(None), slice(oy0 * 8, oy1 * 8), slice(ox0 * 8, ox1 * 8))
                 valid = torch.zeros_like(pred[:, :1])
                 valid[..., (inner[0] - oy0) * 8:(inner[1] - oy0) * 8, (inner[2] - ox0) * 8:(inner[3] - ox0) * 8] = 1
@@ -234,7 +271,7 @@ def decoded_detail_loss(vae, endpoint, target, clothing_mask, edit_mask, cfg, se
             # Windows share one size except at image borders; handle one by one.
             parts = list(zip(preds, truths, cloths, edits, valids))
         else:
-            parts = [(decode_latents_with_grad(vae, z).float(), truth, cloth, edit, torch.ones_like(cloth))]
+            parts = [(decode(z), truth, cloth, edit, torch.ones_like(cloth))]
         boost = float(cfg.loss.get("decoded_graphic_boost", 0.0))
         num_rgb, num_hp, den = zero, zero, zero
         for pred, tr, cl, ed, valid in parts:
@@ -275,6 +312,15 @@ def lr_factor(step: int, cfg) -> float:
     return o.min_lr_ratio + (1 - o.min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
 
 
+def prune_snapshots(out_dir: Path, keep_last: int) -> list:
+    """Delete all but the newest ``keep_last`` weight snapshots (0 = keep all)."""
+    snaps = sorted(Path(out_dir).glob("step[0-9]*.pt"))
+    doomed = snaps[:-keep_last] if keep_last > 0 else []
+    for p in doomed:
+        p.unlink()
+    return doomed
+
+
 def infinite(loader):
     while True:
         yield from loader
@@ -313,6 +359,18 @@ def training_loss(model, teacher, vae, batch, cfg, time_sampler, device, step: i
     ut = x1 - x0
 
     use_coral = teacher is not None and float(cfg.coral.weight) > 0
+    # Compute the frozen teacher before retaining the transformer's backward
+    # graph. At high resolution its dense similarity matrix is substantial.
+    targets = None
+    if use_coral:
+        grid = model.token_hw
+        clothing_tok = pool_valid_mask(batch["clothing_mask"].to(device), grid, threshold=0.25)
+        garment_valid = pool_valid_mask(batch["garment_mask"].to(device), grid, threshold=0.25)
+        with torch.no_grad():
+            targets = teacher.build_targets(
+                batch["image"].to(device), batch["garment"].to(device),
+                edit_tok & clothing_tok & ~drop[:, None], garment_valid, grid, grid,
+            )
     out = model(
         xt, t, inputs["cond"], edit_tok, garment_latent=inputs["garment"], garment_mask=inputs["garment_mask"],
         return_uncertainty=True, return_attention=use_coral,
@@ -335,15 +393,10 @@ def training_loss(model, teacher, vae, batch, cfg, time_sampler, device, step: i
     }
 
     if use_coral:
-        grid = model.token_hw
-        clothing_tok = pool_valid_mask(batch["clothing_mask"].to(device), grid, threshold=0.25)
-        garment_valid = pool_valid_mask(batch["garment_mask"].to(device), grid, threshold=0.25)
-        with torch.no_grad():
-            targets = teacher.build_targets(
-                batch["image"].to(device), batch["garment"].to(device),
-                edit_tok & clothing_tok & ~drop[:, None], garment_valid, grid, grid,
-            )
-        corr, ent, cm = coral_routing_loss(out[2], targets, grid, gaussian_sigma=float(cfg.coral.gaussian_sigma))
+        corr, ent, cm = coral_routing_loss(
+            out[2], targets, grid, gaussian_sigma=float(cfg.coral.gaussian_sigma),
+            checkpoint_loss=bool(cfg.coral.get("checkpoint_loss", False)),
+        )
         loss = loss + float(cfg.coral.weight) * corr + float(cfg.coral.entropy_weight) * ent
         metrics.update(loss_coral=corr, loss_coral_entropy=ent, **cm)
     # Optionally ramp the fine-detail objective with the time curriculum: while
@@ -385,28 +438,36 @@ def evaluate(model, vae, batches, cfg, device, out_dir: Path, step: int) -> dict
     ev = cfg.eval
     results, rows = {}, []
     for bi, batch in enumerate(batches):
-        gen = torch.Generator(device=device).manual_seed(int(ev.seed) + bi)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             inputs = prepare_inputs(vae, batch, model, device, mask_open_px=int(ev.mask_open_px))
-            noise = torch.randn(inputs["known"].shape, device=device, generator=gen)
+            noise = torch.cat([
+                torch.randn((1, *inputs["known"].shape[1:]), device=device,
+                            generator=torch.Generator(device=device).manual_seed(
+                                int(ev.seed) + bi * int(ev.batch_size) + j))
+                for j in range(inputs["known"].shape[0])
+            ])
             images = []
             for spec in ev.samplers:
                 lat = generate(model, inputs, nfe=int(spec.nfe), sampler=spec.name, p=float(ev.p),
                                n_inner=int(ev.n_inner), cfg_scale=float(spec.get("cfg", 1.0)),
-                               cfg_interval=tuple(spec.get("cfg_interval", [0.0, 1.0])), noise=noise)
+                               cfg_interval=tuple(spec.get("cfg_interval", [0.0, 1.0])), noise=noise,
+                               time_shift=spec.get("time_shift"))
                 images.append(lat)
         target = batch["image"].to(device)
         mask = inputs["pixel_mask"]
         cloth = batch["clothing_mask"].to(device)
         row = [batch["garment"].to(device), inputs["agnostic_rgb"], target]
         for spec, lat in zip(ev.samplers, images):
-            rgb = composite(decode_latents(vae, lat.float()).float(), inputs["agnostic_rgb"], mask)
+            rgb = composite(decode_latents(vae, lat.float()).float(), inputs["agnostic_rgb"], mask,
+                            seam_px=float(ev.get("seam_px", 0.0)), feather_px=float(ev.get("feather_px", 0.0)))
             key = f"{spec.name}{spec.nfe}" + (f"_cfg{float(spec.cfg):g}" if float(spec.get("cfg", 1.0)) != 1.0 else "")
+            if spec.get("time_shift") is not None:
+                key += f"_shift{float(spec.time_shift):g}"
             err = (rgb - target).abs().mean(1, keepdim=True)
             results.setdefault(f"{key}_mask_l1", []).append(float(masked_mean(err, mask)))
             results.setdefault(f"{key}_cloth_l1", []).append(float(masked_mean(err, cloth)))
             row.append(rgb)
-        rows.append(torch.stack(row, 1).flatten(0, 1))
+        rows.append(torch.stack(row, 1).flatten(0, 1).cpu())
     grid = torch.cat(rows)
     out_dir.mkdir(parents=True, exist_ok=True)
     save_image((grid + 1) / 2, out_dir / f"step{step:07d}.jpg", nrow=3 + len(ev.samplers))
@@ -423,6 +484,8 @@ def main(argv=None):
     ap.add_argument("overrides", nargs="*")
     args = ap.parse_args(argv)
     cfg = load_cfg(args.config, args.overrides)
+    validate_config(cfg)
+    resume = resolve_resume(args.resume, cfg.train.output_dir)
     # A bounded pilot must not shorten the cosine LR horizon in train.max_steps.
     stop_at_step = int(cfg.train.get("stop_at_step", cfg.train.max_steps))
     if not 0 < stop_at_step <= int(cfg.train.max_steps):
@@ -435,7 +498,7 @@ def main(argv=None):
     out_dir.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(cfg, out_dir / "resolved_config.yaml")
 
-    model = build_model(cfg, load_pretrained=True).to(device)
+    model = build_model(cfg, load_pretrained=resume is None).to(device)
     model.gradient_checkpointing = bool(cfg.train.gradient_checkpointing)
     model.train()
     ema = None
@@ -461,9 +524,10 @@ def main(argv=None):
 
     step = 0
     time_sampler_state = None
-    resume = str(out_dir / "latest.pt") if args.resume == "auto" else args.resume
-    if resume and Path(resume).exists():
+    if resume:
         ckpt = torch.load(resume, map_location="cpu", weights_only=False)
+        if "optimizer" not in ckpt:
+            raise ValueError("--resume requires a full optimizer checkpoint; use weights.init_from for weights only")
         model.load_state_dict(ckpt["model"])
         if ema is not None and ckpt.get("ema") is not None:
             ema.load_state_dict(ckpt["ema"])
@@ -475,7 +539,8 @@ def main(argv=None):
 
     train_ds = make_dataset(cfg, cfg.data.pairs_file, augment=bool(cfg.data.augment))
     loader = DataLoader(train_ds, batch_size=int(cfg.train.batch_size), shuffle=True, drop_last=True,
-                        num_workers=int(cfg.data.num_workers), pin_memory=True, persistent_workers=True)
+                        num_workers=int(cfg.data.num_workers), pin_memory=True,
+                        persistent_workers=int(cfg.data.num_workers) > 0)
     dev_ds = Subset(make_dataset(cfg, cfg.data.test_pairs_file, augment=False), list(cfg.eval.indices))
     dev_batches = list(DataLoader(dev_ds, batch_size=int(cfg.eval.batch_size), shuffle=False))
     time_sampler = EditTimeSampler(cfg)
@@ -486,8 +551,15 @@ def main(argv=None):
     log_path = out_dir / "metrics.jsonl"
     running, t0 = {}, time.time()
 
-    def save(name: str, with_optimizer: bool):
-        state = {"step": step, "model": model.state_dict(), "ema": ema.state_dict() if ema is not None else None,
+    keep_dtype = {"fp32": None, "bf16": torch.bfloat16, "fp16": torch.float16}[str(cfg.train.get("keep_dtype", "fp32"))]
+    keep_last = int(cfg.train.get("keep_last", 0))
+    min_free_gb = float(cfg.train.get("min_free_gb", 0.0))
+
+    def save(name: str, with_optimizer: bool, dtype=None):
+        weights = model.state_dict()
+        if dtype is not None:  # weights-only snapshots; loading casts back to fp32
+            weights = {k: v.to(dtype) if v.is_floating_point() else v for k, v in weights.items()}
+        state = {"step": step, "model": weights, "ema": ema.state_dict() if ema is not None else None,
                  "time_sampler": time_sampler.state_dict(),
                  "config": OmegaConf.to_container(cfg)}
         if with_optimizer:
@@ -497,7 +569,11 @@ def main(argv=None):
         tmp.replace(out_dir / name)
 
     if bool(cfg.eval.at_start) and step == 0:
-        print(json.dumps({"step": 0, **evaluate(ema or model, vae, dev_batches, cfg, device, out_dir / "previews", 0)}))
+        rec = {"step": 0, **evaluate(ema or model, vae, dev_batches, cfg, device, out_dir / "previews", 0)}
+        print(json.dumps(rec), flush=True)
+        with (out_dir / "eval.jsonl").open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+        t0 = time.time()
 
     while step < stop_at_step:
         for g in optimizer.param_groups:
@@ -513,7 +589,7 @@ def main(argv=None):
         step_metrics = {k: sum(v) / len(v) for k, v in step_metrics.items()}
         for k, v in step_metrics.items():
             running.setdefault(k, []).append(v)
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(o.clip_grad_norm))
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(o.clip_grad_norm), error_if_nonfinite=True)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         step += 1
@@ -524,7 +600,7 @@ def main(argv=None):
         if step % int(cfg.train.log_every) == 0:
             rec = {"step": step, **{k: sum(v) / len(v) for k, v in running.items()},
                    "grad_norm": float(grad_norm), "lr": optimizer.param_groups[1]["lr"],
-                   "curriculum": time_sampler.progress(step),
+                   "curriculum": time_sampler.progress(step), "ltg_loc": time_sampler.ltg_loc(step),
                    **{f"p_{k}": v for k, v in zip(EditTimeSampler.KINDS, time_sampler.probabilities(step).tolist())},
                    "sec_per_step": (time.time() - t0) / int(cfg.train.log_every),
                    "mem_gb": torch.cuda.max_memory_allocated() / 2**30}
@@ -535,7 +611,15 @@ def main(argv=None):
         if step % int(cfg.train.save_every) == 0 or step == stop_at_step:
             save("latest.pt", with_optimizer=True)
         if step % int(cfg.train.keep_every) == 0:
-            save(f"step{step:07d}.pt", with_optimizer=False)
+            # Snapshots are expendable; latest.pt (needed to resume) is not.
+            # Skip a snapshot rather than let the disk fill during a later save.
+            free_gb = shutil.disk_usage(out_dir).free / 2**30
+            if free_gb < min_free_gb:
+                print(f"skip snapshot at step {step}: {free_gb:.1f} GB free < {min_free_gb} GB", flush=True)
+            else:
+                save(f"step{step:07d}.pt", with_optimizer=False, dtype=keep_dtype)
+                for p in prune_snapshots(out_dir, keep_last):
+                    print(f"pruned {p.name}", flush=True)
         if step % int(cfg.eval.every) == 0 or step == stop_at_step:
             res = evaluate(ema or model, vae, dev_batches, cfg, device, out_dir / "previews", step)
             print(json.dumps({"step": step, **res}), flush=True)

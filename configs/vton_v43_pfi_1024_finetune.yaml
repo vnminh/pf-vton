@@ -1,0 +1,36 @@
+# Recommended V43 transfer from the preserved V42 step-16000 model.
+# New optimizer / local step count; retain learned VTON conditioning.
+base_config: configs/vton_v43_pfi_1024.yaml
+
+weights:
+  init_from: checkpoints/pfi-safety/v42-step16000.pt
+
+flow:
+  curriculum:
+    # Grounding is already learned. Keep both inference-start and detail cases.
+    start: {pure_noise: 0.10, synchronous: 0.15, detail: 0.40}
+    end: {pure_noise: 0.10, synchronous: 0.15, detail: 0.40}
+
+loss:
+  decoded_follow_curriculum: false
+
+optim:
+  lr: 1.0e-5
+  pretrained_lr_multiplier: 0.5     # 5e-6 backbone peak; V42 ended near 3.8e-6
+  warmup_steps: 100
+
+train:
+  max_steps: 10000                 # fine-tuning LR horizon, independent of pilot stop
+  stop_at_step: 1000
+  keep_every: 500
+  output_dir: logs/vton-v43-pfi-1024-finetune
+
+eval:
+  every: 500
+  at_start: true                   # baseline at 1024 before any parameter update
+  batch_size: 1
+  # Compare schedules at the same eight-denoiser-call budget, no CFG doubling.
+  samplers:
+    - {name: euler, nfe: 8}
+    - {name: dual_loop, nfe: 8}
+    - {name: dual_loop, nfe: 8, time_shift: 1.0}

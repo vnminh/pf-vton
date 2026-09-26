@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from jutils.nn.kl_autoencoder import AutoencoderKL
 
@@ -27,11 +28,13 @@ def decode_latents(vae: AutoencoderKL, latents: torch.Tensor) -> torch.Tensor:
     return vae.decode(latents)
 
 
-def decode_latents_with_grad(vae: AutoencoderKL, latents: torch.Tensor) -> torch.Tensor:
+def decode_latents_with_grad(vae: AutoencoderKL, latents: torch.Tensor, checkpoint_decoder: bool = False) -> torch.Tensor:
     """Same decode as jutils AutoencoderKL.decode, but allows gradient w.r.t. latents.
 
     VAE parameters remain frozen. This is used only for optional RGB/edge supervision.
     """
     z = latents / vae.scale + vae.shift
     z = vae.post_quant_conv(z)
+    if checkpoint_decoder and torch.is_grad_enabled() and z.requires_grad:
+        return checkpoint(vae.decoder, z, use_reentrant=False)
     return vae.decoder(z)

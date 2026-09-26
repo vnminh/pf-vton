@@ -108,6 +108,28 @@ def rectangular_pos_from_square(src: torch.Tensor, dst_hw: Tuple[int, int]) -> t
     return x.permute(0, 2, 3, 1).reshape(1, dst_hw[0] * dst_hw[1], src.shape[-1])
 
 
+def sincos_pos_embed(embed_dim: int, grid_hw: Tuple[int, int]) -> torch.Tensor:
+    """Native 2-D sin-cos table for a rectangular token grid, (1, H*W, D).
+
+    Same layout as the DiT/MAE table the PFT checkpoint was trained with (first
+    half encodes the column, second half the row; one unit per token), so a
+    square grid reproduces the pretrained table. Unlike interpolating that
+    16x16 table, neighbouring tokens stay one full position unit apart.
+    """
+    if embed_dim % 4:
+        raise ValueError("embed_dim must be divisible by 4")
+    h, w = grid_hw
+    rows, cols = torch.meshgrid(torch.arange(h, dtype=torch.float64), torch.arange(w, dtype=torch.float64),
+                                indexing="ij")
+    omega = 1.0 / 10000 ** (torch.arange(embed_dim // 4, dtype=torch.float64) / (embed_dim / 4))
+
+    def one_d(pos):
+        out = pos.reshape(-1, 1) * omega[None]
+        return torch.cat([out.sin(), out.cos()], 1)
+
+    return torch.cat([one_d(cols), one_d(rows)], 1).float()[None]
+
+
 def extract_state_dict(checkpoint: Mapping[str, Any]) -> Dict[str, torch.Tensor]:
     """Accept compact release checkpoints and Lightning training checkpoints."""
     if "state_dict" in checkpoint:

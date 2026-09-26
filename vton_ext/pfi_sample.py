@@ -211,9 +211,36 @@ def generate(
     return x
 
 
-def composite(decoded: torch.Tensor, agnostic_rgb: torch.Tensor, agnostic_mask: torch.Tensor) -> torch.Tensor:
-    """Keep every observed person pixel exactly; generated pixels only inside the mask."""
+def gaussian_blur(x: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Separable Gaussian blur with zero padding (callers normalise by a blurred weight)."""
+    r = max(int(3 * sigma), 1)
+    k = torch.exp(-torch.arange(-r, r + 1, device=x.device, dtype=x.dtype).square() / (2 * sigma * sigma))
+    k = (k / k.sum()).view(1, 1, 1, -1).expand(x.shape[1], 1, 1, -1)
+    x = F.conv2d(x, k, padding=(0, r), groups=x.shape[1])
+    return F.conv2d(x, k.transpose(-1, -2), padding=(r, 0), groups=x.shape[1])
+
+
+def composite(decoded: torch.Tensor, agnostic_rgb: torch.Tensor, agnostic_mask: torch.Tensor,
+              seam_px: float = 0.0, feather_px: float = 0.0) -> torch.Tensor:
+    """Keep every observed person pixel exactly; generated pixels only inside the mask.
+
+    ``seam_px`` > 0: the generated region's low-frequency colour rarely matches
+    the observed pixels at the mask border, which shows as a halo around the
+    whole agnostic outline. Estimate the observed-minus-decoded offset from
+    known pixels only (normalised Gaussian convolution) and add it inside the
+    mask, fading out about ``seam_px`` pixels from the border. ``feather_px``
+    > 0 additionally blends the corrected decode over the known side of the
+    border (the gray-filled inside has no observed pixels to blend with).
+    """
     m = agnostic_mask.to(decoded.dtype)
+    if seam_px > 0:
+        known = 1 - m
+        weight = gaussian_blur(known, seam_px)
+        offset = gaussian_blur((agnostic_rgb - decoded) * known, seam_px) / weight.clamp_min(1e-3)
+        decoded = decoded + m * (2 * weight).clamp(max=1) * offset
+    if feather_px > 0:
+        # 1 at the border (blur = 0.5 on a straight edge), fading to 0 outside.
+        m = torch.maximum(m, (2 * gaussian_blur(m, feather_px)).clamp(max=1))
     return (m * decoded + (1 - m) * agnostic_rgb).clamp(-1, 1)
 
 
@@ -251,6 +278,9 @@ def main(argv=None):
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--no-ema", action="store_true")
     ap.add_argument("--mask-open-px", type=int, default=None, help="default: eval.mask_open_px")
+    ap.add_argument("--time-shift", type=float, default=None, help="default: eval.time_shift or flow.time_shift")
+    ap.add_argument("--seam-px", type=float, default=None, help="default: eval.seam_px or 0")
+    ap.add_argument("--feather-px", type=float, default=None, help="default: eval.feather_px or 0")
     args = ap.parse_args(argv)
 
     cfg = OmegaConf.load(args.config)
@@ -273,15 +303,19 @@ def main(argv=None):
     cfg_scale = args.cfg_scale if args.cfg_scale is not None else float(cfg.eval.get("cfg_scale", 1.0))
     cfg_interval = tuple(args.cfg_interval or cfg.eval.get("cfg_interval", [0.0, 1.0]))
     open_px = args.mask_open_px if args.mask_open_px is not None else int(cfg.eval.mask_open_px)
+    time_shift = args.time_shift if args.time_shift is not None else cfg.eval.get("time_shift")
+    seam_px = args.seam_px if args.seam_px is not None else float(cfg.eval.get("seam_px", 0.0))
+    feather_px = args.feather_px if args.feather_px is not None else float(cfg.eval.get("feather_px", 0.0))
     print(f"step {step}: {len(ds)} samples, {args.sampler} {args.nfe} NFE -> {out}")
     for batch in loader:
         with torch.autocast("cuda", dtype=torch.bfloat16):
             inputs = prepare_inputs(vae, batch, model, device, mask_open_px=open_px)
             noise = torch.randn(inputs["known"].shape, device=device, generator=gen)
             lat = generate(model, inputs, nfe=args.nfe, sampler=args.sampler, p=args.p,
-                           n_inner=args.n_inner, cfg_scale=cfg_scale, cfg_interval=cfg_interval, noise=noise)
+                           n_inner=args.n_inner, cfg_scale=cfg_scale, cfg_interval=cfg_interval, noise=noise,
+                           time_shift=time_shift)
         rgb = decode_latents(vae, lat.float()).float()
-        rgb = composite(rgb, inputs["agnostic_rgb"], inputs["pixel_mask"])
+        rgb = composite(rgb, inputs["agnostic_rgb"], inputs["pixel_mask"], seam_px=seam_px, feather_px=feather_px)
         for img, name in zip(rgb, batch["person_name"]):
             save_image((img + 1) / 2, out / f"{Path(name).stem}.png")
 

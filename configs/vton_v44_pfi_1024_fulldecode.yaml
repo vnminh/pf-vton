@@ -1,0 +1,129 @@
+# V44: continue the 1024x768 fine-tune with the FULL-IMAGE decoded loss.
+#
+#   PYTHONPATH=. python -m vton_ext.pfi_train --config configs/vton_v44_pfi_1024_fulldecode.yaml
+#
+# Why not the V43 24 GB pilot recipe: it decoded a 512x384 latent crop. The SD
+# VAE decoder has GroupNorm (whole-image statistics) and a global mid-block
+# attention, so a decoded crop is not the same image as the full decode. On
+# eight dev images, crop-decoding the *ground-truth* latent differs from the
+# full decode by 0.048 L1 on clothing (VAE reconstruction error itself: 0.035),
+# i.e. the crop loss pushed correct latents away from the truth.
+#
+# The pilot still did its main job. Its dev cloth L1 rose 0.1845 -> 0.2060, but
+# the previews show why: V42 weights run at 1024 produce blurry mush (low L1),
+# while step 1000 produces sharp garments and placed logos (L1 punishes sharp
+# but imperfect detail). So V44 starts from the pilot's step-1000 weights, with
+# a fresh optimizer, and removes the crop bias with the full decode.
+#
+# Otherwise as the V43 fine-tune: small LR, V42's final time mixture, shift 2.
+# Judge checkpoints by the previews; dev L1 favours blur.
+seed: 42
+
+weights:
+  pft: checkpoints/pft-xl_step400k_ema.ckpt    # needed for the position table
+  vae: checkpoints/sd_ae.ckpt
+  dino: checkpoints/dinov3-vits16-pretrain-lvd1689m
+  init_from: checkpoints/pfi-safety/v43-pilot-step1000.pt   # weights only (V42 -> 1024 pilot)
+
+data:
+  root: ../high-resolution-viton-zalando-dataset   # native 1024x768
+  pairs_file: ${data.root}/train_fit_pairs.txt
+  test_pairs_file: ${data.root}/train_dev_pairs.txt
+  official_paired_pairs_file: ${data.root}/test_pairs_paired.txt
+  official_unpaired_pairs_file: ${data.root}/test_pairs.txt
+  clothing_labels: [5, 6, 7]
+  num_workers: 12
+  augment: true
+  person_translate_fraction: 0.03
+  person_scale_range: [0.96, 1.04]
+  garment_translate_fraction: 0.05
+  garment_scale_range: [0.94, 1.06]
+  mask_open_px_range: [0, 24]        # 2x the 512 setting
+
+model:
+  image_hw: [1024, 768]
+  latent_hw: [128, 96]
+  patch_size: 2
+  coral_blocks: [8, 12, 16, 20]
+  coral_heads: 4
+
+flow:
+  time_shift: 2.0
+  ltg_std: 0.6
+  ltg_loc: 0.0
+  ltg_scale: 1.0
+  curriculum:
+    # V42's final mixture from the start: the garment is already read.
+    start: {pure_noise: 0.10, synchronous: 0.15, detail: 0.40}
+    end: {pure_noise: 0.10, synchronous: 0.15, detail: 0.40}
+    detail_range: [0.75, 0.98]
+    detail_std: 0.05
+    detail_unshifted: true
+    gate_metric: coral_local_mass
+    gate_threshold: 0.40
+    gate_min_steps: 0
+    gate_max_steps: 0
+    ramp_steps: 1
+  garment_dropout: 0.10
+
+coral:
+  weight: 0.10
+  entropy_weight: 0.01
+  gaussian_sigma: 0.04               # image-relative tolerance, as V40-V42
+  min_similarity: 0.20
+  cycle_radius: 0.10
+  checkpoint_loss: true
+
+loss:
+  uncertainty_weight: 0.01
+  clothing_boost: 1.0
+  # V42 decoded detail loss, full 1024x768 image (no crop), V42 probability.
+  decoded_rgb_weight: 0.5
+  decoded_highpass_weight: 2.0
+  decoded_graphic_boost: 2.0
+  decoded_min_time: 0.65
+  decoded_probability: 0.5
+  decoded_max_images: 1
+  decoded_follow_curriculum: false
+  decoded_checkpoint: true           # same loss, recompute decoder activations
+  decoded_crop_latent: null
+
+optim:
+  lr: 1.0e-5                     # new embedders
+  pretrained_lr_multiplier: 0.5  # 5e-6 backbone; V42 ended near 3.8e-6
+  weight_decay: 0.0
+  warmup_steps: 100
+  min_lr_ratio: 0.1
+  clip_grad_norm: 1.0
+
+train:
+  batch_size: 4                    # set from the A6000 memory probe
+  gradient_accumulation_steps: 4   # effective batch 16, as V40-V42
+  gradient_checkpointing: true
+  max_steps: 10000
+  ema_decay: 0.0
+  ema_start: 500
+  log_every: 10
+  save_every: 250                  # latest.pt: ~8 GB full state (+8 GB while saving)
+  # Disk (81 GB): inputs ~11 GB, env ~6 GB, latest 16 GB peak. Snapshots are
+  # bf16 weights (1.35 GB), one per evaluation, newest 16 kept (22 GB), and are
+  # skipped rather than risk the resumable latest.pt when free space < 20 GB.
+  keep_every: 500
+  keep_dtype: bf16
+  keep_last: 16
+  min_free_gb: 20
+  output_dir: logs/vton-v44-pfi-1024-fulldecode
+
+eval:
+  every: 500
+  at_start: true                   # step 0 = pilot weights: the baseline to beat
+  seed: 12345
+  batch_size: 2
+  indices: [23, 65, 44, 115, 163, 232, 93, 152]
+  mask_open_px: 12
+  p: 0.7
+  n_inner: 2
+  samplers:
+    - {name: euler, nfe: 8}
+    - {name: dual_loop, nfe: 8}
+    - {name: dual_loop, nfe: 8, time_shift: 1.0}

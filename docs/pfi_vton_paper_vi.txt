@@ -1,0 +1,198 @@
+PFI-VTON: THỬ ĐỒ ẢO BẰNG PATCH FORCING VỚI PHÂN PHỐI THỜI GIAN HỌC ĐẶC TRƯNG TRANG PHỤC
+
+Bản thảo bài báo nghiên cứu, ngày 25/09/2026
+
+TÓM TẮT
+
+Thử đồ ảo từ ảnh cần đồng thời giữ nguyên người mặc, chuyển đúng hình dáng và hoa văn của trang phục tham chiếu, và tạo ảnh trong ngân sách suy luận nhỏ. Các mô hình sinh thường xử lý mọi vùng ảnh ở cùng một mức nhiễu, mặc dù vùng nền đã quan sát được, vùng áo cần tạo mới và chi tiết chữ trên áo có độ khó khác nhau. Chúng tôi xây dựng PFI-VTON, một cách chuyển Patch Forcing [1] sang bài toán thử đồ ảo dưới dạng inpainting trong không gian tiềm ẩn. Các patch ngoài vùng cần sửa của người và toàn bộ patch trang phục là ngữ cảnh sạch tại thời gian t=1; chỉ patch trong mặt nạ được khởi tạo bằng nhiễu và tích phân theo thời gian riêng. Một nhánh trang phục dùng chung trọng số Transformer với nhánh người nhưng chỉ tự chú ý trong nhánh trang phục; người có thể đọc trang phục qua attention một chiều. Nhờ vậy, khóa và giá trị của trang phục được tính một lần rồi tái sử dụng ở mọi bước khử nhiễu. Đóng góp trọng tâm thứ hai là phân phối thời gian hỗn hợp theo chương trình học: ban đầu ưu tiên trạng thái thuần nhiễu để buộc mô hình học điều kiện trang phục, sau khi tín hiệu tương ứng người–áo đủ mạnh mới tăng xác suất các trạng thái gần sạch để học chi tiết. Chúng tôi phát hiện tham số “thời gian trung bình” của bộ lấy mẫu LTG thực ra là cận trên; giới hạn độ lệch của nhánh chi tiết làm tỷ lệ patch có t>0,8 trong hỗn hợp cuối tăng từ 5,6% lên 26,1% trong phép đo bộ lấy mẫu. Trên 256 cặp phát triển nội bộ VITON-HD ở 512×384, checkpoint V41 bước 6000 đạt L1 vùng áo 0,1857 với dual-loop tám lần gọi bộ khử nhiễu, so với 0,1901 của Euler tám lần gọi và 0,2007 của Euler 25 lần gọi. Đây là kết quả nội bộ, chưa phải kết quả trên tập kiểm thử chính thức hoặc một so sánh công bằng với các phương pháp VTON khác. Ở 1024×768, các bản thử V43–V45 đang được khảo sát; lỗi chữ và logo vẫn là hạn chế chính.
+
+Từ khóa: thử đồ ảo; Patch Forcing; flow matching; phân phối thời gian; chương trình học; tương ứng trang phục; suy luận ít bước.
+
+1. GIỚI THIỆU
+
+Cho ảnh người và ảnh sản phẩm của một chiếc áo, thử đồ ảo (virtual try-on, VTON) phải tạo ảnh người mặc chiếc áo ấy với tư thế, cơ thể, khuôn mặt và bối cảnh hợp lý. Các mô hình sinh dựa trên đường đi từ nhiễu tới dữ liệu có thể được học bằng flow matching [2], nhưng VTON còn phải giữ đúng điều kiện trang phục. Bài toán khó hơn inpainting thông thường vì thông tin cần lấp không chỉ được suy ra từ vùng lân cận: kiểu dáng, màu và chữ in cần được chuyển từ ảnh áo khác hình học. VITON-HD [3] đặt ra chuẩn ảnh 1024×768 và cho thấy sai lệch hình học cùng mất chi tiết càng dễ nhận thấy ở độ phân giải cao. Các hệ khuếch tán như TryOnDiffusion [4], StableVITON [5], IDM-VTON [6] và OOTDiffusion [7] giải quyết liên kết người–áo theo các cách khác nhau, thường bằng nhánh đặc trưng trang phục hoặc attention chuyên dụng. CatVTON [8] khảo sát cách ghép đầu vào đơn giản hơn.
+
+Patch Forcing (PF) [1] cho phép mỗi patch ảnh có một thời gian nhiễu riêng, đồng thời dự đoán độ khó để phân bổ các bước cập nhật. Ý tưởng này phù hợp với VTON: vùng nền và người đã quan sát nên giữ nguyên, còn vùng áo cần sinh từ nhiễu; những patch dễ có thể tiến trước để hỗ trợ patch khó. Tuy nhiên, việc chỉ thay đầu vào bằng ảnh người và áo là chưa đủ. Một mô hình được huấn luyện với quá nhiều trạng thái gần sạch có thể học sao chép thông tin mục tiêu trong vùng cần sửa, nhưng khi suy luận từ nhiễu hoàn toàn lại không sử dụng đúng áo tham chiếu. Ngược lại, quá nhiều thời gian thuần nhiễu có thể giúp học màu và kiểu áo nhưng bỏ sót nét chữ, hoa văn nhỏ. Do đó cách phân bố thời gian huấn luyện là một quyết định của mô hình điều kiện trang phục, không chỉ là siêu tham số của sampler.
+
+Nghiên cứu này đề xuất hai thành phần gắn với nhau. Thứ nhất, chúng tôi biểu diễn VTON thành patch-forcing inpainting trong một DiT đã được tiền huấn luyện: ngữ cảnh người và trang phục luôn sạch, còn patch trong mặt nạ nhận thời gian riêng. Thứ hai, chúng tôi dùng một hỗn hợp thời gian có giai đoạn “học dùng áo” từ nhiễu và giai đoạn “học chi tiết” gần sạch; việc chuyển giai đoạn dựa vào một thống kê tương ứng người–áo. Giám sát attention lấy cảm hứng từ CORAL [9] và dùng đặc trưng DINOv3 [10], nhưng hàm mất mát và chuẩn hóa attention trong triển khai của chúng tôi khác CORAL gốc. Các thành phần này là một hệ thống thích nghi PF cho VTON; bài báo không nhận PF, DINOv3 hay ý tưởng correspondence distillation là phát minh mới.
+
+Mục tiêu vận hành là dưới mười lần gọi bộ khử nhiễu cho một ảnh khi không dùng classifier-free guidance (CFG). Tám lần gọi là số đo của nhánh người trong sampler được đánh giá; thời gian mã hóa ảnh, mã hóa áo một lần và giải mã VAE phải được tính riêng khi báo cáo độ trễ thực tế. Chúng tôi trình bày rõ phần đã đo được và những thí nghiệm còn thiếu để không suy diễn từ tám ảnh xem trước thành kết luận về chất lượng toàn bộ VITON-HD.
+
+2. CÔNG TRÌNH LIÊN QUAN
+
+VTON và bảo toàn trang phục. VITON-HD [3] dùng chuẩn hóa nhận biết sai lệch để cải thiện ảnh độ phân giải cao. TryOnDiffusion [4] dùng hai UNet và liên kết ẩn để chuyển hình học trang phục. StableVITON [5] học tương ứng ngữ nghĩa trong latent diffusion; IDM-VTON [6] kết hợp thông tin ngữ nghĩa mức cao với đặc trưng áo mức thấp. OOTDiffusion [7] bỏ bước warp tường minh nhưng vẫn có nhánh UNet áo. CatVTON [8] cho thấy biểu diễn đầu vào đơn giản hơn vẫn có thể hiệu quả. FitDiT [11] nhấn mạnh đặc trưng độ phân giải cao và chi tiết tần số cao. PFI-VTON khác các hệ trên ở việc giữ patch người và patch áo như những vai trò thời gian của một PF-DiT dùng chung trọng số; khác biệt kiến trúc này chưa được chứng minh là tốt hơn các baseline VTON vì chưa có đối sánh trên tập test.
+
+Patch-wise generation. Công trình PF [1] chỉ ra rằng lấy thời gian độc lập cho từng patch một cách ngây thơ gây lệch giữa huấn luyện và suy luận. PF dùng bộ lấy mẫu LTG khống chế thời gian tối đa của một mẫu và dùng độ bất định dự đoán để cập nhật vùng khó theo lịch khác vùng dễ. Chúng tôi kế thừa backbone và dual-loop, nhưng bổ sung điều kiện ảnh áo, ràng buộc vùng chỉnh sửa và phân phối thời gian dành riêng cho việc học áo. Đường đi tuyến tính từ nhiễu tới ảnh và hồi quy vận tốc có quan hệ với flow matching [2].
+
+Giám sát tương ứng. CORAL [9] dùng tương ứng ngoại sinh đáng tin cậy để điều chỉnh attention giữa người và áo; DINOv3 [10] cung cấp đặc trưng thị giác dày để tính tương đồng. Triển khai này dùng DINOv3-S/16 đóng băng, lọc bằng độ tương đồng và tính nhất quán chu trình, rồi giám sát một tập con head trong bốn tầng Transformer. Đây là biến thể lấy cảm hứng từ CORAL, không phải bản sao phương pháp hay kết quả định lượng của CORAL.
+
+3. THIẾT LẬP BÀI TOÁN
+
+Gọi I là ảnh mục tiêu của người đang mặc áo G, A là ảnh người đã xóa thông tin áo, M là mặt nạ vùng được phép sửa, P là ảnh DensePose và M_G là mặt nạ sản phẩm áo. Khi suy luận chỉ có A, M, P, G và M_G; I được dùng trong huấn luyện và đánh giá. Bộ mã hóa VAE E và giải mã D được cố định. Với ảnh 512×384, E tạo latent 4×64×48; với ảnh 1024×768, latent là 4×128×96. Patch latent 2×2 tạo lưới 32×24=768 token hoặc 64×48=3072 token cho mỗi nhánh. Bộ điều kiện của người nối latent A, mặt nạ latent và latent P; nhánh áo nối latent G và M_G.
+
+Mặt nạ M được mở rộng ngẫu nhiên 0–12 pixel khi huấn luyện 512×384, 0–24 pixel ở 1024×768; lúc đánh giá dùng bán kính cố định 6 hoặc 12 pixel tương ứng. Vùng viền mới được xóa khỏi A và sinh lại để giảm rò rỉ áo cũ. Trước khi nạp mô hình, patch nằm trong mặt nạ được đánh dấu “EDIT”; patch còn lại là “KNOWN”. Những pixel ngoài mặt nạ sau cùng được lấy từ ảnh A, vì vậy nhận dạng người và nền ở ngoài mặt nạ được bảo toàn bằng phép ghép ảnh. Phép ghép này khác việc dán texture áo trực tiếp: vùng áo vẫn được sinh bởi mô hình.
+
+4. PHƯƠNG PHÁP PFI-VTON
+
+4.1. DiT với ba vai trò token
+
+Backbone PFT-XL/2 [1] có 28 block Transformer, kích thước ẩn 1152, 16 attention head, embedding thời gian theo từng token và một đầu dự đoán log-phương sai. Triển khai V40–V42 thêm lớp chèn điều kiện 9 kênh cho người, lớp chèn 5 kênh cho áo, cùng embedding vai trò EDIT/KNOWN/GARMENT. Tổng số tham số mới ở cấu hình này là 73.728; toàn bộ backbone cũng được fine-tune, do đó không được hiểu đây là tổng số tham số có thể huấn luyện. Lớp chèn điều kiện người khởi tạo bằng không để ban đầu không phá hủy backbone; bốn kênh latent của lớp chèn áo khởi tạo từ lớp chèn ảnh tiền huấn luyện.
+
+Ở thời gian huấn luyện, cho z_1=E(I), ε~N(0,I_4), và thời gian t_i của patch EDIT. Trạng thái latent tại patch ấy là
+
+    z_(t_i),i = t_i z_1,i + (1-t_i) ε_i,        u_i = z_1,i - ε_i.             (1)
+
+Các patch KNOWN luôn chứa E(A) với t=1, chứ không phải latent I. Điều này giữ đầu vào đã biết giống nhau ở huấn luyện và suy luận. Mọi patch áo G cũng mang t=1. Trạng thái chuẩn của flow matching này làm rõ ý nghĩa thời gian: t=0 là nhiễu, t=1 là dữ liệu sạch.
+
+4.2. Attention một chiều và bộ nhớ áo chính xác
+
+Trong mỗi block, token áo tự attention với token áo. Token người gửi query tới khóa/giá trị của cả nhánh người lẫn nhánh áo; nhánh áo không đọc trạng thái người. Vì vậy biểu diễn áo tại mọi tầng chỉ phụ thuộc G và M_G, không phụ thuộc z_t của người. Đặt K_G^l,V_G^l là khóa/giá trị áo tại tầng l. Bộ mã hóa áo tính toàn bộ {(K_G^l,V_G^l)} một lần và tái sử dụng ở từng lần gọi bộ khử nhiễu. Đây là tương đương chính xác của forward đầy đủ với cùng trọng số, không phải xấp xỉ bộ nhớ đệm. Unit test trong repository so sánh hai đường đi. Nếu dùng CFG, nhánh áo rỗng cũng có bộ nhớ đệm riêng.
+
+Cách thiết kế này không cần warper hình học tường minh, ReferenceNet hay một UNet áo thứ hai. Dù vậy, mỗi lần gọi vẫn tính attention cho toàn bộ token người; sampler chỉ thay lịch cập nhật latent, chưa bỏ phép tính trên patch dễ. Vì thế không thể suy ra tăng tốc thời gian thực chỉ từ số patch cập nhật ít hơn.
+
+4.3. Giám sát định tuyến người–áo
+
+Trong các block 8, 12, 16, 20, bốn head đầu được lấy phân phối attention A_ij^lh từ query người i sang các khóa áo j. DINOv3-S/16 [10] mã hóa I và G; với mỗi i lấy j*(i) có cosine similarity cao nhất trong vùng áo hợp lệ. Chỉ giữ query nằm trong vùng EDIT/áo, không bị garment dropout, có cosine >=0,20 và tương ứng ngược gần i trong bán kính chuẩn hóa 0,10. Đích của query đáng tin cậy là Gaussian tọa độ áo quanh j*, độ lệch chuẩn 0,04 ở 512×384. Hàm mất mát cross-entropy từng head và entropy được chuẩn hóa theo log số token áo, rồi lấy trung bình trên query hợp lệ.
+
+Lưu ý A_ij^lh được chuẩn hóa CHỈ trên khóa áo để làm loss. Attention thực dùng softmax chung trên khóa người và áo. Vì vậy “khối lượng attention gần match” được ghi trong log chỉ đo định tuyến có điều kiện khi đọc áo; nó không chứng minh lượng attention tuyệt đối dành cho áo tăng. Ngoài ra correspondence ở lưới 32×24 thô hơn nét chữ riêng lẻ. Đây là những giới hạn trực tiếp của phép đo CoRAL-style.
+
+5. PHÂN PHỐI THỜI GIAN ĐỂ HỌC TRANG PHỤC
+
+5.1. Hỗn hợp bốn nhánh
+
+Chỉ thời gian các token EDIT được lấy mẫu. Token KNOWN và GARMENT luôn giữ t=1. Tại bước huấn luyện s, phân phối thời gian của một ảnh là hỗn hợp
+
+    q_s(t) = π_0(s) q_noise + π_S(s) q_sync
+             + π_D(s) q_detail + π_L(s) q_LTG,                              (2)
+    π_L(s) = 1 - π_0(s) - π_S(s) - π_D(s).
+
+Nhánh q_noise đặt tất cả t_i=0, trùng chính xác với trạng thái bắt đầu suy luận của vùng áo. Ở đây target I không còn xuất hiện trong vùng EDIT, nên dự đoán vận tốc phải dựa vào áo tham chiếu, DensePose và ngữ cảnh người. Nhánh q_sync lấy một thời gian logit-normal và gán đều cho patch EDIT; nó duy trì năng lực trên đường Euler đồng bộ. Nhánh q_LTG lấy trần thời gian t̄ từ logit-normal rồi tạo các thời gian không đồng bộ theo patch. Nhánh q_detail lấy t̄ đều trong [0,75;0,98] và tạo các patch gần sạch để học những sai số còn lại ở hoa văn và chi tiết. “Buộc học áo” ở đây là động cơ thiết kế: đóng góp nhân quả của q_noise cần thí nghiệm loại bỏ nhánh này từ cùng checkpoint khởi tạo.
+
+Với biến chuẩn η_i~N(0,1), LTG đang dùng trong code tạo
+
+    t_i = t̄ - |η_i| min(t̄/2, σ),                                     (3)
+
+và thay các giá trị âm bằng mẫu đều trong [0,t̄]. Ở V40, cả nhánh LTG lẫn nhánh chi tiết dùng σ=0,6. Vì trừ nửa-normal luôn làm thời gian giảm, t̄ không phải trung bình của các t_i mà là cận trên. Tên “detail” và khoảng t̄ cao không đảm bảo dữ liệu huấn luyện thực sự gần sạch. V41 chỉ đổi σ của nhánh chi tiết thành 0,05, giữ nhánh LTG rộng và các nhánh còn lại. Khi chuyển sang 1024×768, cấu hình V43–V45 dùng phép dịch t' = t/[t+a(1-t)] với a=2 cho các nhánh thường, còn nhánh chi tiết không dịch để duy trì ví dụ gần sạch. Đây là lựa chọn cấu hình, chưa được chứng minh tối ưu.
+
+5.2. Chương trình học có cổng tương ứng
+
+V40 bắt đầu với (π_0,π_S,π_D)=(0,50;0,20;0,00), nghĩa là 30% còn lại thuộc LTG. Sau khi EMA hệ số 0,98 của “coral_local_mass” đạt 0,30 và đã huấn luyện ít nhất 1500 bước, hoặc đến bước 6000 dù chưa đạt, chương trình tuyến tính trong 3000 bước chuyển sang (0,10;0,15;0,40), với 35% LTG. Thời gian thuần nhiễu không bị loại bỏ ở giai đoạn cuối vì đó vẫn là trạng thái vào lúc suy luận. Trong log V40, cổng mở ở bước 1500 với EMA khoảng 0,412 và hoàn tất ramp ở bước 4500. Một phép đo attention đạt ngưỡng không tự chứng minh rằng mô hình đã đọc đúng toàn bộ logo: kiểm tra áo đúng/áo tráo/áo rỗng và metric ký tự vẫn cần thiết.
+
+5.3. Liên hệ giữa lịch huấn luyện và ít bước suy luận
+
+Dual-loop tiến patch được xem là dễ trước để dùng làm ngữ cảnh cho patch khó. Nó đi qua trạng thái không đồng bộ theo không gian, nên nhánh LTG giúp mô hình nhìn thấy các cấu hình thời gian tương tự trong huấn luyện. Nhánh synchronous bao phủ trạng thái Euler; nhánh thuần nhiễu bao phủ điểm xuất phát; nhánh detail bổ sung trạng thái muộn mà bộ lấy mẫu LTG rộng ít chạm tới. Bốn nhánh giải quyết các sai lệch khác nhau giữa train và rollout. Tuy vậy, các checkpoint V40–V42 không phải các phép ablation song song với cùng số bước và cùng trọng số khởi đầu; dữ liệu hiện có chỉ xác nhận độ bao phủ thời gian và hành vi hệ thống, chưa cô lập lợi ích chất lượng của từng nhánh.
+
+6. HÀM MẤT MÁT VÀ TỐI ƯU
+
+Vận tốc v_θ được học bằng bình phương sai số trong vùng EDIT, với trọng số 1+C ở latent thuộc parse áo C:
+
+    L_flow = Σ_i w_i ||v_θ(z_t,t,c)_i-u_i||² / Σ_i w_i,    w_i=M_i(1+C_i). (4)
+
+Đầu log-phương sai s_θ nhận loss NLL trọng số 0,01. Sai số vận tốc được stop-gradient trong loss NLL để head này dự đoán độ khó mà không kéo vận tốc theo cách không mong muốn. Loss giám sát correspondence và entropy lần lượt có trọng số 0,10 và 0,01. Trong V42 trở đi, một loss ảnh giải mã thưa được áp dụng cho tối đa một ảnh đủ điều kiện trong microbatch khi thời gian EDIT trung bình >=0,65: endpoint ước lượng là ẑ_1=z_t+(1-t)v_θ, ảnh D(ẑ_1) chịu L1 RGB trọng số 0,5 và L1 cao tần trọng số 2,0. Trọng số cao hơn ở vùng tương phản với màu áo trung vị của I là proxy chỉ có trong loss huấn luyện; nó không phải detector chữ và không được truyền vào bộ sinh khi suy luận.
+
+V40–V42 dùng AdamW, batch hiệu dụng 16 (microbatch 4, tích lũy 4), bf16, gradient clipping 1,0, backbone learning rate cao nhất 2e-5 và nhóm module mới 1e-4. V40 huấn luyện tới bước 5000 từ PFT-XL/2; V41 nối từ checkpoint V40 tới bước 6000 bằng thay đổi độ lệch nhánh detail; V42 nối từ bước 6000 và thêm loss giải mã. V42 thực tế có checkpoint đầy đủ ở bước 16000, không phải một kết quả 20000 bước đã hoàn tất. V43 khởi tạo trọng số từ V42 bước 16000 ở 1024×768, dùng optimizer mới và lịch thời gian cuối ngay từ đầu. Thông số và đường dẫn tái lập nằm trong các config của repository.
+
+7. SUY LUẬN
+
+Tại suy luận, patch EDIT bắt đầu từ ε và t=0; patch KNOWN giữ E(A), t=1; nhánh áo sạch được mã hóa một lần. Với Euler tám bước, toàn bộ patch EDIT có cùng mức tăng Δt. Với dual-loop tám lần đánh giá, có bốn khoảng thời gian ngoài và hai lần gọi mỗi khoảng. Sau dự đoán đầu, khoảng 30% token EDIT có bất định cao nhất (ngưỡng phân vị p=0,7) đi hai nửa bước; token còn lại đi một bước lớn. Lần gọi thứ hai nhìn thấy ngữ cảnh dễ đã tiến xa hơn. Bộ giải mã VAE tạo ảnh RGB và phép ghép sao chép pixel quan sát ngoài mặt nạ.
+
+Trong cấu hình đánh giá chính CFG=1, tám NFE đúng bằng tám lần gọi Transformer nhánh người. CFG khác 1 thêm một lần gọi điều kiện áo rỗng cho mỗi bước, nên dual-loop “8 bước, CFG 2” tốn 16 lần gọi nhánh người; không thể so trực tiếp với 8-call không guidance theo cùng ngân sách. Số lần mã hóa áo và độ trễ VAE cần được báo riêng nếu nghiên cứu báo thời gian chạy, điều mà dữ liệu hiện tại chưa cung cấp.
+
+8. THIẾT KẾ THỰC NGHIỆM
+
+8.1. Dữ liệu và giao thức
+
+Các thí nghiệm đã kiểm toán dùng VITON-HD [3]. Chúng tôi tách 11.391 cặp fit và 256 cặp phát triển từ tập train; hai danh sách không trùng tên ảnh người hoặc tên ảnh áo. Chưa kiểm tra trùng lặp thị giác của áo. Tập test paired/unpaired chính thức được giữ riêng và CHƯA có kết quả ở bản thảo này. Tám cặp nhiều logo/chữ được cố định làm preview; chúng hữu ích để nhìn lỗi nhưng không thay thế thống kê trên 256 cặp. Các phép so sampler dùng cùng nhiễu cho cùng ảnh và một seed duy nhất. RGB được chuẩn hóa về [-1,1]. L1 vùng áo là trung bình trên từng ảnh rồi trên các ảnh trong audit đầy đủ; L1 trong các preview trainer dùng trung bình theo microbatch nên không nên so trị tuyệt đối của hai giao thức như cùng estimator. “Contrast” là mặt nạ dựa trên độ lệch màu khỏi màu trung vị của áo mục tiêu, không phải nhãn logo hoặc OCR.
+
+8.2. Biến thể được ghi nhận
+
+V40: 512×384, hỗn hợp thời gian với nhánh detail độ lệch rộng σ=0,6; từ PFT-XL/2 đến bước 5000.
+V41: 512×384, chỉ thu hẹp độ lệch detail thành σ=0,05; từ V40 bước 5000 đến bước 6000.
+V42: 512×384, thêm loss RGB/cao tần đã giải mã; từ V41 bước 6000, checkpoint kiểm tra cuối ở bước 16000.
+V43: 1024×768, chuyển trọng số V42 bước 16000, thử 1000 bước; trên GPU 24 GB loss giải mã chỉ dùng crop 512×384 dù Transformer vẫn xử lý ảnh đủ 1024×768.
+V44: tiếp tục từ trọng số V43 bước 1000 với loss giải mã toàn ảnh trên GPU bộ nhớ lớn hơn; config ghi nhận kiểm tra tới bước 1250 nhưng không có báo cáo full-dev trong repository.
+V45: config thử nghiệm tiếp từ V44 bước 1250, thay learning rate, độ rộng đích CoRAL, embedding vị trí có thể học và hậu xử lý đường biên. Chưa có kết quả định lượng V45 đủ điều kiện để đưa vào bảng chính.
+
+8.3. Thước đo và đối chứng còn thiếu
+
+Audit 256 cặp hiện có gồm L1 vùng EDIT, L1 vùng áo, L1/high-pass của vùng tương phản và SSIM vùng áo [12]. Để đánh giá mục tiêu “giữ đúng trang phục”, cần thêm LPIPS [13], đánh giá chữ/logo bằng OCR có kiểm tra nhãn và vùng không đọc được, cùng phép thử can thiệp đổi áo tham chiếu trong khi giữ nguyên người, mặt nạ và seed. Cần chạy các baseline VTON với cùng độ phân giải, dữ liệu, tiền xử lý và ngân sách gọi mạng; hiện chưa thể tuyên bố hơn các công trình [3–8,11].
+
+9. KẾT QUẢ VÀ PHÂN TÍCH
+
+9.1. Độ bao phủ thời gian
+
+Phép kiểm tra bộ lấy mẫu trên 16.384 ví dụ cho thấy thời gian trung bình của patch ở nhánh detail V40 là 0,531, không gần khoảng t̄=[0,70;0,98] như tên nhánh có thể gợi ý. Sau thay đổi V41, trung bình tăng lên 0,825; tỷ lệ patch detail có t>0,8 tăng từ 10,2% lên 61,0%, và có t>0,9 tăng từ 2,0% lên 18,3%. Ở hỗn hợp cuối, tỷ lệ patch EDIT có t>0,8 tăng từ 5,6% lên 26,1%; t>0,9 tăng từ 0,96% lên 7,5%. Các số này đo CHÍNH phân phối thời gian, không chứng minh rằng V41 tốt hơn V40 trên một tập ảnh cố định. Log các batch V41 cũng cho tỷ lệ gần tương ứng, 26,2% và 8,1% ở hai ngưỡng. Nguồn nội bộ: docs/pfi_vton_method.md, mục 6.1 và tests/test_pfi.py.
+
+9.2. Dấu hiệu học điều kiện áo
+
+Ở pha đầu V40, CoRAL local mass trung bình từ 0,084 trong bước 1–100 tăng lên 0,412 ở bước 1401–1500 và khoảng 0,491 ở bước 3401–3500. Cổng mở ở bước 1500, ramp hoàn tất tại bước 4500. Điều đó cho thấy các head được giám sát học phân bố tập trung hơn quanh match của teacher; do cách chuẩn hóa đã nêu ở mục 4.3, đây chưa phải phép đo “mô hình phụ thuộc áo” dưới attention chung. Tổn thất flow từ 0,694 ở bước 1–100 giảm xuống 0,409 ở bước 1401–1500, nhưng các cửa sổ sau có phân phối thời gian khác nên đường loss thô không là bằng chứng duy nhất. Nguồn: docs/assets/v40-audit/audit-summary.json.
+
+9.3. So sánh sampler trên 256 cặp phát triển
+
+Đây là audit paired của hai checkpoint V41 với cùng nhiễu theo ảnh. Cột “call” đếm lần gọi bộ khử nhiễu nhánh người, không tính mã hóa áo/VAE. L1 nhỏ hơn tốt hơn; SSIM lớn hơn tốt hơn.
+
+Checkpoint   Sampler/call   EDIT L1   Áo L1    Contrast L1   HP-contrast L1   SSIM áo
+V41-5500     Euler/8        0,1697    0,1948   0,3363        0,1583           0,5448
+V41-5500     Dual-loop/8    0,1655    0,1902   0,3328        0,1563           0,5553
+V41-5500     Euler/25       0,1792    0,2064   0,3489        0,1647           0,5212
+V41-5500     Euler/50       0,1823    0,2101   0,3529        0,1667           0,5134
+V41-6000     Euler/8        0,1678    0,1901   0,3363        0,1579           0,5530
+V41-6000     Dual-loop/8    0,1637    0,1857   0,3324        0,1561           0,5632
+V41-6000     Euler/25       0,1764    0,2007   0,3483        0,1640           0,5304
+V41-6000     Euler/50       0,1792    0,2040   0,3519        0,1658           0,5234
+
+Ở checkpoint V41-6000, dual-loop/8 cải thiện L1 vùng áo khoảng 2,3% so với Euler/8 trong cùng ngân sách. Euler/25 và /50 kém hơn Euler/8 theo những metric paired này; nhiều bước hơn không tự sửa được sự trôi của quỹ đạo sinh. Trong phép profile 64 ảnh, lỗi endpoint giải mã trên rollout tăng về cuối dù trên quỹ đạo ground-truth nó giảm. Đây là bằng chứng quan sát của sai lệch train–rollout, chưa phải phép thử loại trừ mọi nguyên nhân. Mức cải thiện từ V41-5500 lên V41-6000 cũng không thể được quy riêng cho lịch thời gian vì có thêm 500 update. Nguồn: docs/pfi_vton_method.md, mục 6.2–7.2; script scripts/audit_pfi_timesteps.py.
+
+9.4. Chữ/logo và thí nghiệm 1024×768
+
+Trên tám ví dụ cố định, V42 bước 8500 có L1 vùng áo 0,1744 với dual-loop/8 không CFG. Mô hình thường chuyển đúng loại áo, độ dài tay, màu và vị trí đồ họa, nhưng nhiều chữ vẫn sai ký tự: ví dụ logo Lee, FILA hoặc Wrangler được đặt gần đúng mà không giữ nguyên từ. CFG đôi khi làm nét chữ rõ hơn nhưng trong sweep tám ảnh V41-6000, CFG 1,5–3 làm các metric pixel xấu đi và cần 16 call thay vì tám. Vì vậy nghiên cứu chưa có bằng chứng rằng CFG là cách nâng chất lượng ở cùng ngân sách. Nguồn: docs/assets/v42/step8500-preview.jpg và docs/pfi_vton_method.md, mục 7.3–7.4.
+
+V43 minh họa một vấn đề chọn metric ở độ phân giải cao. Trên tám ảnh cố định, L1 vùng áo với dual-loop/8 dịch thời gian 2 tăng từ 0,18447 tại bước 0 lên 0,19193 tại bước 500 và 0,20604 tại bước 1000; với dịch thời gian 1, chuỗi tương ứng là 0,18085, 0,18643, 0,19827. Ảnh preview bước 500/1000 lại cho áo và một số logo sắc, có cấu trúc hơn trạng thái chuyển trọng số bước 0 bị mờ. L1 phạt chi tiết sắc nhưng lệch vài pixel; nhận định thị giác này không biến sự tăng L1 thành thắng lợi định lượng. Các ảnh ở docs/assets/v43-audit/ và bảng số trong log V43 trên server là kết quả pilot tám mẫu, không phải benchmark 256 ảnh hoặc test chính thức. Config V44 ghi nhận rằng giải mã crop latent tạo ảnh khác giải mã toàn ảnh trên cùng latent mục tiêu, với L1 áo giữa hai cách giải mã 0,048 ở tám ảnh; vì vậy V44 chuyển sang loss giải mã toàn ảnh. Đây là phép kiểm tra nội bộ, không là đối sánh V43–V44 có kiểm soát. Các thay đổi V45 hiện là giả thuyết cải tiến và cần đánh giá độc lập.
+
+10. THẢO LUẬN, GIỚI HẠN VÀ THỬ NGHIỆM CẦN THÊM
+
+Đóng góp thực nghiệm rõ nhất của lịch thời gian là chỉ ra độ lệch giữa “khoảng trần” và thời gian patch thực nhận, cùng cách điều chỉnh một nhánh để tăng độ bao phủ gần sạch. Cơ chế học áo từ pure noise có cơ sở vì trạng thái đó không chứa latent mục tiêu trong vùng EDIT; tuy nhiên VTON còn có DensePose và ngữ cảnh người, nên cách nói “chỉ có áo” là quá mạnh. Cần so với lịch cố định cuối, lịch không pure noise, lịch không detail và lịch detail rộng V40, khởi tạo từ cùng checkpoint và chạy bằng số ví dụ bằng nhau. Đo độ phụ thuộc áo bằng can thiệp áo đúng, áo tráo và áo rỗng ở cùng seed, cả ở t=0 lẫn các trạng thái gần sạch.
+
+Giám sát CORAL-style có thể tập trung head nhưng teacher pseudo-match có lỗi do biến dạng vải, chi tiết đối xứng và che khuất. Metric local mass chỉ đo phân bố đã chuẩn hóa trên áo; nên báo thêm tỷ trọng attention áo dưới softmax chung và chất lượng match trên vùng chữ có nhãn. Mặt nạ agnostic đôi khi xóa cả phần quần hoặc tóc không cần thay, khiến mô hình phải tái tạo thông tin không có trong ảnh áo. Lỗi này cần đánh giá tách khỏi năng lực chuyển trang phục.
+
+Ngân sách tám call chưa đồng nghĩa latency thấp ở 1024×768, bởi số token mỗi nhánh tăng từ 768 lên 3072 và mô hình vẫn chạy đầy đủ token người ở mỗi lần gọi. Chưa có số đo FPS/giây mỗi ảnh, VRAM suy luận, FID, KID, LPIPS, OCR, phép thử unpaired hoặc benchmark baseline tương ứng. Kết quả 256 ảnh là dev nội bộ với một seed và chủ yếu ở 512×384; chưa thể gọi PFI-VTON là SOTA hay khẳng định “giỏi nhất dưới mười bước”. Đặc biệt, logo nét hơn nhưng sai ký tự không đạt yêu cầu bảo toàn thương hiệu. Các phép kiểm chứng cần thiết gồm OCR từ được xác minh, LPIPS trên vùng áo, đánh giá người dùng hoặc thẩm định theo nhãn, và báo cáo độ bao phủ các logo đọc được.
+
+Một nghiên cứu tiếp theo hợp lý là thêm đường đặc trưng áo độ phân giải cao vẫn có thể cache, hoặc giám sát cấu trúc chữ trong vùng có nhãn. Nên so sánh với tăng độ phân giải VAE, thay đổi bảng vị trí, và chiến lược giảm sai lệch rollout. Các cấu hình V44/V45 mới thăm dò vài hướng này, chưa phải bằng chứng nhân quả cho bản thảo hiện tại.
+
+11. KẾT LUẬN
+
+PFI-VTON diễn đạt thử đồ ảo thành inpainting với thời gian theo patch: vùng người quan sát và áo tham chiếu sạch, vùng áo trên người được sinh từ nhiễu; một nhánh áo attention một chiều cung cấp khóa/giá trị có thể cache chính xác. Phân phối thời gian chuyên biệt cho VTON duy trì trạng thái bắt đầu thuần nhiễu để học điều kiện áo, trạng thái đồng bộ cho Euler, trạng thái bất đồng bộ cho Patch Forcing và tăng trạng thái gần sạch sau cổng tương ứng để học chi tiết. Phép đo nội bộ xác nhận sự thay đổi độ bao phủ thời gian và cho thấy dual-loop tám call tốt hơn Euler tám call theo L1/SSIM trên 256 cặp phát triển VITON-HD. Những kết luận về bảo toàn chữ, lợi ích nhân quả của chương trình học, chất lượng độ phân giải 1024×768 và ưu thế so với VTON khác còn chờ đối chứng và đánh giá trên tập test chính thức.
+
+TÀI LIỆU THAM KHẢO
+
+[1] J. Schusterbauer, M. Gui, Y. Li, P. Ma, F. Krause và B. Ommer, “Denoising, Fast and Slow: Difficulty-Aware Adaptive Sampling for Image Generation”, CVPR, 2026. https://arxiv.org/abs/2604.19141
+
+[2] Y. Lipman, R. T. Q. Chen, H. Ben-Hamu, M. Nickel và M. Le, “Flow Matching for Generative Modeling”, ICLR, 2023. https://arxiv.org/abs/2210.02747
+
+[3] S. Choi, S. Park, M. Lee và J. Choo, “VITON-HD: High-Resolution Virtual Try-On via Misalignment-Aware Normalization”, CVPR, 2021. https://arxiv.org/abs/2103.16874
+
+[4] L. Zhu, D. Yang, T. Zhu, F. Reda, W. Chan, C. Saharia, M. Norouzi và I. Kemelmacher-Shlizerman, “TryOnDiffusion: A Tale of Two UNets”, CVPR, 2023. https://openaccess.thecvf.com/content/CVPR2023/html/Zhu_TryOnDiffusion_A_Tale_of_Two_UNets_CVPR_2023_paper.html
+
+[5] J. Kim, G. Gu, M. Park, S. Park và J. Choo, “StableVITON: Learning Semantic Correspondence with Latent Diffusion Model for Virtual Try-On”, arXiv:2312.01725, 2023. https://arxiv.org/abs/2312.01725
+
+[6] Y. Choi, S. Kwak, K. Lee, H. Choi và J. Shin, “Improving Diffusion Models for Authentic Virtual Try-on in the Wild”, ECCV, 2024. https://www.ecva.net/papers/eccv_2024/papers_ECCV/papers/11626.pdf
+
+[7] Y. Xu, T. Gu, W. Chen và A. Chen, “OOTDiffusion: Outfitting Fusion Based Latent Diffusion for Controllable Virtual Try-On”, AAAI, 2025. https://ojs.aaai.org/index.php/AAAI/article/view/32973
+
+[8] Z. Chong và cộng sự, “CatVTON: Concatenation Is All You Need for Virtual Try-On with Diffusion Models”, ICLR, 2025. https://arxiv.org/abs/2407.15886
+
+[9] J. Kim và cộng sự, “CORAL: Correspondence Alignment for Improved Virtual Try-On”, arXiv:2602.17636, 2026. https://arxiv.org/abs/2602.17636
+
+[10] O. Siméoni và cộng sự, “DINOv3”, arXiv:2508.10104, 2025. https://arxiv.org/abs/2508.10104
+
+[11] B. Jiang và cộng sự, “FitDiT: Advancing the Authentic Garment Details for High-fidelity Virtual Try-on”, arXiv:2411.10499, 2024. https://arxiv.org/abs/2411.10499
+
+[12] Z. Wang, A. C. Bovik, H. R. Sheikh và E. P. Simoncelli, “Image Quality Assessment: From Error Visibility to Structural Similarity”, IEEE Transactions on Image Processing 13(4), 600–612, 2004. https://ece.uwaterloo.ca/~z70wang/research/ssim/
+
+[13] R. Zhang, P. Isola, A. A. Efros, E. Shechtman và O. Wang, “The Unreasonable Effectiveness of Deep Features as a Perceptual Metric”, CVPR, 2018. https://openaccess.thecvf.com/content_cvpr_2018/html/Zhang_The_Unreasonable_Effectiveness_CVPR_2018_paper.html
+
+NGUỒN KẾT QUẢ NỘI BỘ VÀ TÁI LẬP
+
+Mã và cấu hình: vton_ext/pfi_model.py; vton_ext/pfi_train.py; vton_ext/pfi_sample.py; vton_ext/coral.py; configs/vton_v40_pfi_coral.yaml; configs/vton_v41_pfi_detail.yaml; configs/vton_v42_pfi_decoded_detail.yaml; configs/vton_v43_pfi_1024_24gb.yaml; configs/vton_v44_pfi_1024_fulldecode.yaml; configs/vton_v45_pfi_1024.yaml.
+
+Sổ tay kiểm toán: docs/pfi_vton_method.md; docs/vton_v40_training_audit.md; docs/vton_v41_detail_pilot.md; docs/vton_v43_high_resolution_review.md. Số liệu và hình đã lưu: docs/assets/v40-audit/audit-summary.json; docs/assets/v41-audit/; docs/assets/v42/; docs/assets/v43-audit/. Các nguồn này thuộc chính dự án và không thay cho kết quả benchmark công khai, có thể kiểm tra lại trước khi nộp bài.

@@ -1,0 +1,16 @@
+# Full-resolution PFI fine-tuning on the current RTX 3090.
+base_config: configs/vton_v43_pfi_1024_finetune.yaml
+
+train:
+  batch_size: 2
+  gradient_accumulation_steps: 8
+  log_every: 1
+  save_every: 100
+  output_dir: logs/vton-v43-pfi-1024-24gb
+
+loss:
+  # Full-resolution transformer, 512x384 clothing window for decoded loss,
+  # plus 32px context excluded from the loss. Crop jitter changes each draw.
+  decoded_crop_latent: [64, 48]
+  decoded_crop_margin: 4
+  decoded_probability: 1.0

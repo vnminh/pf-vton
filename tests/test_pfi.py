@@ -3,13 +3,14 @@ import unittest
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 from vton_ext.coral import CoralTargets, coral_routing_loss
 from vton_ext.pfi_model import VTONInpaintDiT
 from omegaconf import OmegaConf
 
 from vton_ext.pfi_sample import generate, open_mask, shift_time
-from vton_ext.pfi_train import EditTimeSampler, decoded_detail_loss, load_cfg, lr_factor
+from vton_ext.pfi_train import EditTimeSampler, decoded_detail_loss, load_cfg, lr_factor, resolve_resume, validate_config
 from vton_ext.utils import expand_patch_values
 
 
@@ -35,6 +36,39 @@ def inputs(b=2):
 
 
 class PFITests(unittest.TestCase):
+    def test_coral_checkpointed_loss_matches_gradients(self):
+        torch.manual_seed(12)
+        coords = torch.rand(2, 12, 2)
+        targets = CoralTargets(torch.randint(12, (2, 12)), coords,
+                               torch.rand(2, 12) > 0.3, torch.rand(2, 12))
+        logits = [torch.randn(2, 2, 12, 12, requires_grad=True) for _ in range(2)]
+        maps = {i: x.softmax(-1) for i, x in enumerate(logits)}
+        a, b, metrics = coral_routing_loss(maps, targets, (4, 3))
+        grads = torch.autograd.grad(a + 0.1 * b, logits, retain_graph=True)
+        ac, bc, mc = coral_routing_loss(maps, targets, (4, 3), checkpoint_loss=True)
+        grads_c = torch.autograd.grad(ac + 0.1 * bc, logits)
+        torch.testing.assert_close(a, ac)
+        torch.testing.assert_close(b, bc)
+        for k in metrics:
+            torch.testing.assert_close(metrics[k], mc[k])
+        for g, gc in zip(grads, grads_c):
+            torch.testing.assert_close(g, gc)
+
+    def test_v43_dimensions_and_missing_resume(self):
+        root = Path(__file__).resolve().parents[1]
+        cfg = load_cfg(str(root / "configs/vton_v43_pfi_1024.yaml"))
+        validate_config(cfg)
+        cfg.model.latent_hw = [64, 48]
+        with self.assertRaises(ValueError):
+            validate_config(cfg)
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(FileNotFoundError):
+                resolve_resume("auto", tmp)
+            self.assertIsNone(resolve_resume(None, tmp))
+            (Path(tmp) / "latest.pt").touch()
+            self.assertEqual(resolve_resume("auto", tmp), Path(tmp) / "latest.pt")
+
     def test_cached_garment_kv_matches_direct(self):
         m, x = tiny().eval(), inputs()
         t = torch.rand(2, 12)
@@ -148,6 +182,27 @@ class PFITests(unittest.TestCase):
         self.assertGreater(float(raw.min()), 0.5)          # stays near clean
         torch.testing.assert_close(shifted, shift_time(raw, 2.0))
 
+    def test_prune_snapshots_keeps_newest_and_latest(self):
+        import tempfile
+        from vton_ext.pfi_train import prune_snapshots
+        with tempfile.TemporaryDirectory() as tmp:
+            for n in (1000, 2000, 3000, 4000):
+                (Path(tmp) / f"step{n:07d}.pt").touch()
+            (Path(tmp) / "latest.pt").touch()
+            gone = prune_snapshots(Path(tmp), 2)
+            self.assertEqual([p.name for p in gone], ["step0001000.pt", "step0002000.pt"])
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()),
+                             ["latest.pt", "step0003000.pt", "step0004000.pt"])
+            self.assertEqual(prune_snapshots(Path(tmp), 0), [])
+
+    def test_bf16_snapshot_loads_into_fp32_model(self):
+        m = tiny()
+        state = {k: v.to(torch.bfloat16) if v.is_floating_point() else v for k, v in m.state_dict().items()}
+        m2 = tiny()
+        m2.load_state_dict(state)
+        self.assertEqual(m2.blocks[0].attn.qkv.weight.dtype, torch.float32)
+        torch.testing.assert_close(m2.blocks[0].attn.qkv.weight, m.blocks[0].attn.qkv.weight, atol=1e-2, rtol=1e-2)
+
     def test_coral_loss_prefers_target(self):
         target = torch.tensor([[5, 7]])
         coords = torch.stack(torch.meshgrid(torch.linspace(0, 1, 4), torch.linspace(0, 1, 3), indexing="ij"), -1)
@@ -182,6 +237,62 @@ class PFITests(unittest.TestCase):
         s2 = EditTimeSampler(cfg)
         s2.observe(100, {"m": 0.0})        # max steps forces the gate
         self.assertEqual(s2.ramp_start, 100)
+
+    def test_native_sincos_table_matches_pretrained_layout(self):
+        import numpy as np
+        from patch_flow.models.dit import get_2d_sincos_pos_embed
+        from vton_ext.utils import sincos_pos_embed
+        ref = torch.from_numpy(get_2d_sincos_pos_embed(64, 16)).float()[None]
+        torch.testing.assert_close(sincos_pos_embed(64, (16, 16)), ref)
+        rect = sincos_pos_embed(64, (8, 6))
+        self.assertEqual(tuple(rect.shape), (1, 48, 64))
+        # Row-major token order: token (r, c) of the rectangle equals token (r, c) of the square table.
+        torch.testing.assert_close(rect[0].view(8, 6, 64), ref[0].view(16, 16, 64)[:8, :6])
+        with self.assertRaises(ValueError):
+            VTONInpaintDiT(latent_hw=(8, 6), hidden_size=64, depth=1, num_heads=4, pos_embed="rope")
+        m = VTONInpaintDiT(latent_hw=(8, 6), hidden_size=64, depth=1, num_heads=4, pos_embed_trainable=True)
+        self.assertIn("pos_embed", [n for n, p in m.pretrained_parameters() if p.requires_grad])
+        self.assertFalse(tiny().pos_embed.requires_grad)
+
+    def test_seam_correction_keeps_known_pixels_and_removes_border_offset(self):
+        from vton_ext.pfi_sample import composite
+        mask = torch.zeros(1, 1, 64, 64)
+        mask[..., 16:48, 16:48] = 1
+        truth = torch.full((1, 3, 64, 64), 0.8)
+        agnostic = truth * (1 - mask)
+        # One decode is continuous across the border; pasting the observed
+        # pixels back exposes its brightness shift there as a step.
+        decoded = truth + 0.06
+        plain = composite(decoded, agnostic, mask)
+        fixed = composite(decoded, agnostic, mask, seam_px=4.0)
+        known = (1 - mask).bool().expand_as(truth)
+        torch.testing.assert_close(fixed[known], agnostic[known])
+        edge = (plain - truth).abs()[..., 16, 20:44].mean(), (fixed - truth).abs()[..., 16, 20:44].mean()
+        self.assertLess(float(edge[1]), 0.5 * float(edge[0]))
+        centre = (fixed - plain)[..., 32, 32].abs().max()
+        self.assertLess(float(centre), 0.01)  # deep inside the mask stays as generated
+        feathered = composite(decoded, agnostic, mask, seam_px=4.0, feather_px=2.0)
+        torch.testing.assert_close(feathered[..., 0:4, 0:4], agnostic[..., 0:4, 0:4])
+
+    def test_coarse_to_fine_location_moves_times_toward_clean(self):
+        cfg = OmegaConf.create({"flow": {
+            "ltg_std": 0.6, "ltg_loc": 0.0, "ltg_scale": 1.0,
+            "curriculum": {"start": {"pure_noise": 0.3, "synchronous": 0.3, "detail": 0.0},
+                           "end": {"pure_noise": 0.1, "synchronous": 0.15, "detail": 0.4},
+                           "detail_range": [0.75, 0.98], "gate_metric": "m", "gate_threshold": 2.0,
+                           "gate_min_steps": 0, "gate_max_steps": 0, "ramp_steps": 100,
+                           "ltg_loc_start": -1.0, "ltg_loc_end": 0.8}}})
+        ts = EditTimeSampler(cfg)
+        ts.observe(0, {})
+        self.assertEqual(ts.ltg_loc(0), -1.0)
+        self.assertAlmostEqual(ts.ltg_loc(50), -0.1)
+        self.assertEqual(ts.ltg_loc(500), 0.8)
+        torch.manual_seed(0)
+        early = ts(4096, 16, "cpu", step=0)
+        late = ts(4096, 16, "cpu", step=100)
+        self.assertLess(float(early.mean()), 0.3)
+        self.assertGreater(float(late.mean()), float(early.mean()) + 0.25)
+        self.assertLess(float((early > 0.8).float().mean()), 0.05)
 
     def test_open_mask_per_sample_radius(self):
         m = torch.zeros(2, 1, 21, 21)
@@ -303,6 +414,14 @@ class DecodedDetailTests(unittest.TestCase):
         loss.backward()
         self.assertGreater(float(endpoint.grad[0].abs().sum()), 0)
         self.assertEqual(float(endpoint.grad[1].abs().sum()), 0)
+        reference_grad = endpoint.grad.clone()
+        endpoint.grad = None
+        cfg.loss.decoded_checkpoint = True
+        checked, _ = decoded_detail_loss(vae, endpoint, target, mask, mask, cfg,
+                                        torch.tensor([True, False]))
+        checked.backward()
+        torch.testing.assert_close(checked, loss)
+        torch.testing.assert_close(endpoint.grad, reference_grad)
         skipped, _ = decoded_detail_loss(vae, endpoint, target, mask, mask, cfg,
                                          torch.tensor([False, False]))
         self.assertEqual(float(skipped.detach()), 0)

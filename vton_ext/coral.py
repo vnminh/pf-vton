@@ -7,6 +7,7 @@ from typing import Dict, Iterable, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from transformers import AutoImageProcessor, AutoModel
 
 
@@ -103,6 +104,7 @@ def coral_routing_loss(
     garment_hw: Tuple[int, int],
     query_weights: torch.Tensor | None = None,
     gaussian_sigma: float = 0.035,
+    checkpoint_loss: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, dict]:
     if not attention_maps:
         zero = targets.garment_coord.sum() * 0.0
@@ -124,15 +126,26 @@ def coral_routing_loss(
     # Supervise every selected layer rather than only the barycenter of a layer
     # average. The old barycenter objective allowed broad attention that mixed
     # sleeve/body colors while still landing at the correct mean coordinate.
-    layer_ce, layer_entropy = [], []
-    for attention in layers:
+    def layer_terms(attention, target_prob):
         attention = attention / attention.sum(dim=-1, keepdim=True).clamp_min(1e-8)
         p = attention.clamp_min(1e-8)
-        layer_ce.append(-(target_prob[:, None] * p.log()).sum(dim=-1).mean(dim=1))
-        layer_entropy.append(-(p * p.log()).sum(dim=-1) / math.log(max(p.shape[-1], 2)))
+        logp = p.log()
+        return (-(target_prob[:, None] * logp).sum(dim=-1).mean(dim=1),
+                -(p * logp).sum(dim=-1) / math.log(max(p.shape[-1], 2)))
+
+    layer_ce, layer_entropy = [], []
+    for attention in layers:
+        if checkpoint_loss and torch.is_grad_enabled() and attention.requires_grad:
+            ce_i, ent_i = checkpoint(layer_terms, attention, target_prob, use_reentrant=False)
+        else:
+            ce_i, ent_i = layer_terms(attention, target_prob)
+        layer_ce.append(ce_i)
+        layer_entropy.append(ent_i)
     ce = torch.stack(layer_ce).mean(dim=0) / math.log(max(layers[0].shape[-1], 2))
     entropy = torch.stack(layer_entropy).mean(dim=(0, 2))
-    attention = torch.stack(layers).mean(dim=(0, 2))
+    # Diagnostics do not need a backward graph or a stack of all B*H*N*N maps.
+    with torch.no_grad():
+        attention = sum(a.mean(dim=1) for a in layers) / len(layers)
 
     reliable = targets.reliable.to(attention.dtype)
     weights = reliable

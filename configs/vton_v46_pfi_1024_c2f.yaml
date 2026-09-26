@@ -1,0 +1,135 @@
+# V46: V45 with a coarse-to-fine time curriculum over training steps.
+#
+#   PYTHONPATH=. python -m vton_ext.pfi_train --config configs/vton_v46_pfi_1024_c2f.yaml
+#
+# V45 used the late-t detail mixture (40% detail, t in [0.75, 0.98]) at full
+# weight from step 0; its dev cloth L1 got worse after step 500 (0.168 -> 0.201
+# at step 2000, dual_loop8 shift 1) and previews did not improve. V46 restarts
+# from the same V44 step-1250 weights with a fresh optimizer and schedules the
+# editable-token times by step instead:
+#   step 0:     35% pure noise, 25% synchronous, 0% detail, LTG location -1.0
+#               (median t_bar 0.27, before the resolution shift) -> coarse
+#               layout, garment placement and shape;
+#   step 6000+: 10% pure noise, 15% synchronous, 40% detail, LTG location +0.8
+#               (median t_bar 0.69) -> fine texture and letters.
+# Linear in between. The decoded detail loss only fires on t >= 0.65 examples,
+# so it grows with the curriculum by itself. Other V45 fixes are unchanged.
+seed: 42
+
+weights:
+  pft: checkpoints/pft-xl_step400k_ema.ckpt    # needed for the position table
+  vae: checkpoints/sd_ae.ckpt
+  dino: checkpoints/dinov3-vits16-pretrain-lvd1689m
+  init_from: checkpoints/pfi-safety/v44-step1250.pt   # weights only (V42 -> V43 pilot -> V44)
+
+data:
+  root: ../high-resolution-viton-zalando-dataset   # native 1024x768
+  pairs_file: ${data.root}/train_fit_pairs.txt
+  test_pairs_file: ${data.root}/train_dev_pairs.txt
+  official_paired_pairs_file: ${data.root}/test_pairs_paired.txt
+  official_unpaired_pairs_file: ${data.root}/test_pairs.txt
+  clothing_labels: [5, 6, 7]
+  num_workers: 12
+  augment: true
+  person_translate_fraction: 0.03
+  person_scale_range: [0.96, 1.04]
+  garment_translate_fraction: 0.05
+  garment_scale_range: [0.94, 1.06]
+  mask_open_px_range: [0, 24]        # 2x the 512 setting
+
+model:
+  image_hw: [1024, 768]
+  latent_hw: [128, 96]
+  patch_size: 2
+  coral_blocks: [8, 12, 16, 20]
+  coral_heads: 4
+  pos_embed: interpolate
+  pos_embed_trainable: true
+
+flow:
+  time_shift: 2.0
+  ltg_std: 0.6
+  ltg_loc: 0.0
+  ltg_scale: 1.0
+  curriculum:
+    # Coarse -> fine by training step (the gate opens at step 0; no metric gate).
+    start: {pure_noise: 0.35, synchronous: 0.25, detail: 0.00}
+    end: {pure_noise: 0.10, synchronous: 0.15, detail: 0.40}
+    ltg_loc_start: -1.0
+    ltg_loc_end: 0.8
+    detail_range: [0.75, 0.98]
+    detail_std: 0.05
+    detail_unshifted: true
+    gate_metric: coral_local_mass
+    gate_threshold: 1.0e9
+    gate_min_steps: 0
+    gate_max_steps: 0
+    ramp_steps: 6000
+  garment_dropout: 0.10
+
+coral:
+  weight: 0.10
+  entropy_weight: 0.01
+  gaussian_sigma: 0.02               # same token tolerance as sigma 0.04 at 512
+  min_similarity: 0.20
+  cycle_radius: 0.10
+  checkpoint_loss: true
+
+loss:
+  uncertainty_weight: 0.01
+  clothing_boost: 1.0
+  # V42 decoded detail loss, full 1024x768 image (no crop), V42 probability.
+  decoded_rgb_weight: 0.5
+  decoded_highpass_weight: 2.0
+  decoded_graphic_boost: 2.0
+  decoded_min_time: 0.65
+  decoded_probability: 0.5
+  decoded_max_images: 1
+  decoded_follow_curriculum: false
+  decoded_checkpoint: true           # same loss, recompute decoder activations
+  decoded_crop_latent: null
+
+optim:
+  lr: 4.0e-5                     # new embedders
+  pretrained_lr_multiplier: 0.5  # 2e-5 backbone (V42 peak); V44's 5e-6 did not move the loss
+  weight_decay: 0.0
+  warmup_steps: 200
+  min_lr_ratio: 0.1
+  clip_grad_norm: 1.0
+
+train:
+  batch_size: 4                    # set from the A6000 memory probe
+  gradient_accumulation_steps: 4   # effective batch 16, as V40-V42
+  gradient_checkpointing: true
+  max_steps: 10000
+  ema_decay: 0.0
+  ema_start: 500
+  log_every: 10
+  save_every: 250                  # latest.pt: ~8 GB full state (+8 GB while saving)
+  # Disk (81 GB): inputs ~11 GB, env ~6 GB, latest 16 GB peak. Snapshots are
+  # bf16 weights (1.35 GB), one per evaluation, newest 16 kept (22 GB), and are
+  # skipped rather than risk the resumable latest.pt when free space < 20 GB.
+  keep_every: 500
+  keep_dtype: bf16
+  keep_last: 12
+  min_free_gb: 20
+  output_dir: logs/vton-v46-pfi-1024-c2f
+
+eval:
+  every: 500
+  at_start: true                   # step 0 = V44 step-1250 weights: the baseline to beat
+  seed: 12345
+  batch_size: 2
+  indices: [23, 65, 44, 115, 163, 232, 93, 152]
+  mask_open_px: 12
+  p: 0.7
+  n_inner: 2
+  time_shift: 1.0                  # pfi_sample CLI default
+  seam_px: 8.0
+  feather_px: 0.0
+  cfg_scale: 1.0                   # pfi_sample CLI default until previews favour CFG 2
+  cfg_interval: [0.0, 1.0]
+  samplers:
+    - {name: dual_loop, nfe: 8, time_shift: 1.0}
+    - {name: dual_loop, nfe: 8, time_shift: 1.0, cfg: 2.0}
+    - {name: dual_loop, nfe: 8}
