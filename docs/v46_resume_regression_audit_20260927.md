@@ -6,6 +6,10 @@ references. The step-3000 weights are substantially worse on correctly paired
 cases. Restore a clean checkpoint from before that resume and the historical
 paired split; do not continue the step-3000 optimizer.
 
+For the active code paths, protected pair lists, and verified new checkpoint
+after restoring the deleted logs, see
+[the restart record](#restart-after-restoring-the-accidentally-deleted-logs).
+
 ## Evidence for the cause
 
 The dataset ZIP's `train_pairs.txt` has 11,647 rows, of which **11,646 are
@@ -174,7 +178,7 @@ The short audit processes used Supervisor and did not modify model or optimizer
 weights. After diagnosis, the user explicitly requested retraining on the new
 RTX 4090 server; that recovery run is described below.
 
-## Recovery
+## Initial recovery before accidental log deletion
 
 Use the last verified clean V46 checkpoint at or before step 1750 if available.
 Step 1500 exists on the old server and is already being copied to the new one.
@@ -193,7 +197,7 @@ df3b35f8935fa91217f3265532727d16c88020294c404405b7eabd1c428984f5
 The requested recovery was launched on **175.155.64.157:16377, RTX 4090** using
 [`vton_v46_pfi_1024_paired_recovery.yaml`](../configs/vton_v46_pfi_1024_paired_recovery.yaml)
 and [`run_pfi_v46_paired_recovery.sh`](../scripts/run_pfi_v46_paired_recovery.sh).
-The resolved server configuration is
+The initial resolved server configuration was
 `/workspace/pfi-resume-audit/code/configs/v46-recovery-server.yaml`.
 
 - Output: `/workspace/patch-forcing-vton/logs/vton-v46-pfi-1024-paired-recovery`.
@@ -234,3 +238,59 @@ After a period of healthy paired training, compare the full fixed dev set and
 profile denoising time. Use the untouched official test split for final
 generalization claims. First repair garment correspondence; extra logo/detail
 losses cannot repair contradictory targets.
+
+## Restart after restoring the accidentally deleted logs
+
+The restored backup contains the original `vton-v46-pfi-1024-c2f` snapshots,
+but no saved checkpoint from the newer paired-recovery run. Its deleted pair
+files caused the old Supervisor entry to fail. The restored step-1500 snapshot
+loads successfully and has the same SHA-256 recorded above. Recovery therefore
+starts from those clean weights with a fresh optimizer and a counter of zero;
+it cannot preserve updates that were never saved in the available backup.
+
+Local source was restored to `/workspace/patch-forcing-vton`, replacing the
+empty source folders. All **111 uploaded files** match their archive contents.
+All **37 training regression tests** pass on the server. The active Supervisor
+entry now uses this main repository rather than the temporary audit code.
+
+The active server configuration is now
+`/workspace/patch-forcing-vton/configs/v46-recovery-server.yaml`.
+Read-only paired lists are stored **outside `logs/`**:
+
+```text
+/workspace/pfi-resume-audit/pairs/v46-paired-recovery/train_fit_pairs.txt
+/workspace/pfi-resume-audit/pairs/v46-paired-recovery/train_dev_pairs.txt
+```
+
+Their counts and hashes exactly match the historical 11,391/256 split above.
+All seven modalities exist for all 11,647 pairs; decoded dataset samples have
+shape `[3, 1024, 768]`, with native image size 768×1024. Provenance is also
+stored outside the log tree at
+`/workspace/pfi-resume-audit/recovery-provenance-20260927.json`.
+
+Two recovery settings were added: `train.save_first_step: 10` creates a full
+resumable checkpoint before the regular 250-update save, and
+`train.require_pair_fingerprints: true` rejects legacy resume checkpoints that
+cannot verify the data split. The clean legacy step-1500 snapshot remains a
+weights initializer. Later restarts automatically resume this new run's
+`latest.pt`, including its optimizer and curriculum, after verifying its pair
+fingerprints. The output path and monitoring commands above still apply.
+
+The restored model's step-zero clothing L1 is **0.182482**, matching the initial
+clean recovery baseline. At new recovery step **10**, flow loss is **0.340754**,
+gradient norm **0.268112**, CoRAL local mass **0.297537**, and peak GPU allocation
+**36.135 GiB**; all logged values are finite. This remains an early health check,
+not a final assessment of VTON quality.
+
+The new `latest.pt` at recovery step 10 was loaded and verified: **8,141,593,709
+bytes**, 298 model tensors, 298 optimizer parameter states all at update 10,
+curriculum state, and matching fit/dev fingerprints. Its SHA-256 is:
+
+```text
+2392bbbaae1cbd88099ac0fff6c9880fae19fcc5886e86c64cb87cf6b2574082
+```
+
+Supervisor remains **RUNNING** on the RTX 4090 after the save, with 100% GPU
+utilization and approximately 45 GB disk space free. This checkpoint is now the
+resumable state for this recovery run; its counter is separate from the parent
+snapshot's original step-1500 counter.

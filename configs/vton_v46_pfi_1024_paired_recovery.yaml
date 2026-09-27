@@ -8,6 +8,8 @@ weights:
 
 train:
   output_dir: logs/vton-v46-pfi-1024-paired-recovery
+  save_first_step: 10             # early resumable state before the usual step 250
+  require_pair_fingerprints: true # prevent a legacy bad checkpoint becoming this run's latest
   # Bound disk use on the 81 GB instance while preserving full latest.pt.
   keep_last: 4
   min_free_gb: 24

@@ -505,6 +505,8 @@ def main(argv=None):
         if "optimizer" not in ckpt:
             raise ValueError("--resume requires a full optimizer checkpoint; use weights.init_from for weights only")
         if not validate_resume_pairs(ckpt.get("data_pairs"), data_pairs):
+            if bool(cfg.train.get("require_pair_fingerprints", False)):
+                raise ValueError("This run requires checkpoint pair fingerprints. Use verified clean weights.init_from for a legacy checkpoint.")
             print("WARNING: legacy checkpoint has no pair fingerprints; its original split cannot be verified.", flush=True)
     seed_everything(int(cfg.seed))
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -624,7 +626,8 @@ def main(argv=None):
             with log_path.open("a") as f:
                 f.write(json.dumps(rec) + "\n")
             running, t0 = {}, time.time()
-        if step % int(cfg.train.save_every) == 0 or step == stop_at_step:
+        if (step % int(cfg.train.save_every) == 0 or step == stop_at_step
+                or step == int(cfg.train.get("save_first_step", -1))):
             save("latest.pt", with_optimizer=True)
         if step % int(cfg.train.keep_every) == 0:
             # Snapshots are expendable; latest.pt (needed to resume) is not.

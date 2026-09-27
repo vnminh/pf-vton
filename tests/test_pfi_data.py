@@ -4,6 +4,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import torch
+
 from vton_ext.data import VitonHDDataset
 from vton_ext.pfi_train import main
 
@@ -39,6 +41,22 @@ class DatasetPairTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Unpaired garment"):
                 main(["--config", str(config), f"data.root={self.root}",
                       f"data.pairs_file={self.root / 'train_pairs.txt'}", f"train.output_dir={out}"])
+            build.assert_not_called()
+        self.assertFalse(out.exists())
+
+    def test_recovery_rejects_unverified_legacy_checkpoint_before_model_allocation(self):
+        fit, dev = self.root / "fit.txt", self.root / "dev.txt"
+        fit.write_text("001_00.jpg 001_00.jpg\n")
+        dev.write_text("002_00.jpg 002_00.jpg\n")
+        checkpoint = self.root / "legacy.pt"
+        torch.save({"step": 3000, "optimizer": {}}, checkpoint)
+        config = Path(__file__).resolve().parents[1] / "configs/vton_v46_pfi_1024_c2f.yaml"
+        out = self.root / "should-not-be-created"
+        with patch("vton_ext.pfi_train.build_model") as build:
+            with self.assertRaisesRegex(ValueError, "requires checkpoint pair fingerprints"):
+                main(["--config", str(config), "--resume", str(checkpoint),
+                      f"data.root={self.root}", f"data.pairs_file={fit}", f"data.test_pairs_file={dev}",
+                      "eval.indices=[0]", "train.require_pair_fingerprints=true", f"train.output_dir={out}"])
             build.assert_not_called()
         self.assertFalse(out.exists())
 
