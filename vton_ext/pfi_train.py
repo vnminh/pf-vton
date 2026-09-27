@@ -29,6 +29,7 @@ from torchvision.utils import save_image
 from patch_flow.timestep_schedules import LogitNormalTruncatedGaussian
 from vton_ext.coral import DINOv3CoralTeacher, coral_routing_loss
 from vton_ext.data import VitonHDDataset
+from vton_ext.pairs import split_manifest, validate_resume_pairs
 from vton_ext.pfi_model import VTONInpaintDiT
 from vton_ext.pfi_sample import composite, generate, prepare_inputs, shift_time
 from vton_ext.utils import expand_patch_values, pool_valid_mask, seed_everything
@@ -83,6 +84,9 @@ def resolve_resume(resume, output_dir):
     path = Path(output_dir) / "latest.pt" if resume == "auto" else Path(resume)
     if not path.is_file():
         raise FileNotFoundError(f"Requested resume checkpoint does not exist: {path}")
+    invalid = path.with_name(path.name + ".invalid-data.json")
+    if invalid.exists():
+        raise ValueError(f"Checkpoint flagged for invalid training data: {invalid}. Use a verified clean backup in a new run.")
     return path
 
 
@@ -490,6 +494,18 @@ def main(argv=None):
     stop_at_step = int(cfg.train.get("stop_at_step", cfg.train.max_steps))
     if not 0 < stop_at_step <= int(cfg.train.max_steps):
         raise ValueError("train.stop_at_step must be positive and <= train.max_steps")
+    # Validate supervision before allocating the large model or touching run logs.
+    train_ds = make_dataset(cfg, cfg.data.pairs_file, augment=bool(cfg.data.augment))
+    dev_base = make_dataset(cfg, cfg.data.test_pairs_file, augment=False)
+    data_pairs = split_manifest(train_ds.pair_path, dev_base.pair_path)
+    if any(not 0 <= int(i) < len(dev_base) for i in cfg.eval.indices):
+        raise ValueError("eval.indices must be valid indices in the development split")
+    ckpt = torch.load(resume, map_location="cpu", weights_only=False) if resume else None
+    if ckpt is not None:
+        if "optimizer" not in ckpt:
+            raise ValueError("--resume requires a full optimizer checkpoint; use weights.init_from for weights only")
+        if not validate_resume_pairs(ckpt.get("data_pairs"), data_pairs):
+            print("WARNING: legacy checkpoint has no pair fingerprints; its original split cannot be verified.", flush=True)
     seed_everything(int(cfg.seed))
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -525,9 +541,6 @@ def main(argv=None):
     step = 0
     time_sampler_state = None
     if resume:
-        ckpt = torch.load(resume, map_location="cpu", weights_only=False)
-        if "optimizer" not in ckpt:
-            raise ValueError("--resume requires a full optimizer checkpoint; use weights.init_from for weights only")
         model.load_state_dict(ckpt["model"])
         if ema is not None and ckpt.get("ema") is not None:
             ema.load_state_dict(ckpt["ema"])
@@ -536,12 +549,12 @@ def main(argv=None):
         step = int(ckpt["step"])
         time_sampler_state = ckpt.get("time_sampler")
         print(f"resumed {resume} at step {step}")
+        del ckpt
 
-    train_ds = make_dataset(cfg, cfg.data.pairs_file, augment=bool(cfg.data.augment))
     loader = DataLoader(train_ds, batch_size=int(cfg.train.batch_size), shuffle=True, drop_last=True,
                         num_workers=int(cfg.data.num_workers), pin_memory=True,
                         persistent_workers=int(cfg.data.num_workers) > 0)
-    dev_ds = Subset(make_dataset(cfg, cfg.data.test_pairs_file, augment=False), list(cfg.eval.indices))
+    dev_ds = Subset(dev_base, list(cfg.eval.indices))
     dev_batches = list(DataLoader(dev_ds, batch_size=int(cfg.eval.batch_size), shuffle=False))
     time_sampler = EditTimeSampler(cfg)
     if time_sampler_state:
@@ -556,11 +569,14 @@ def main(argv=None):
     min_free_gb = float(cfg.train.get("min_free_gb", 0.0))
 
     def save(name: str, with_optimizer: bool, dtype=None):
+        # Also catch an external pair-file replacement during a running job.
+        validate_resume_pairs(data_pairs, split_manifest(train_ds.pair_path, dev_base.pair_path))
         weights = model.state_dict()
         if dtype is not None:  # weights-only snapshots; loading casts back to fp32
             weights = {k: v.to(dtype) if v.is_floating_point() else v for k, v in weights.items()}
         state = {"step": step, "model": weights, "ema": ema.state_dict() if ema is not None else None,
                  "time_sampler": time_sampler.state_dict(),
+                 "data_pairs": data_pairs,
                  "config": OmegaConf.to_container(cfg)}
         if with_optimizer:
             state["optimizer"] = optimizer.state_dict()

@@ -10,6 +10,8 @@ from torch.utils.data import Dataset
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
 
+from vton_ext.pairs import read_pairs
+
 
 _IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 
@@ -136,6 +138,11 @@ class VitonHDDataset(Dataset):
                     self.root / f"{phase}_pairs_unpaired.txt",
                     self.base / f"{phase}_pairs_unpaired.txt",
                 ])
+            else:
+                candidates.extend([
+                    self.root / f"{phase}_pairs_paired.txt",
+                    self.base / f"{phase}_pairs_paired.txt",
+                ])
             candidates.extend([
                 self.root / f"{phase}_pairs.txt",
                 self.base / f"{phase}_pairs.txt",
@@ -147,18 +154,7 @@ class VitonHDDataset(Dataset):
         if pair_path is None:
             raise FileNotFoundError("Could not find a VITON-HD pair list. Pass data.pairs_file explicitly.")
 
-        rows = []
-        with pair_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                parts = line.strip().split()
-                if not parts:
-                    continue
-                person = parts[0]
-                garment = parts[1] if len(parts) > 1 else parts[0]
-                rows.append((person, garment))
-        if not rows:
-            raise RuntimeError(f"No pairs found in {pair_path}")
-        self.rows = rows
+        self.rows = read_pairs(pair_path, paired=order == "paired")
         self.pair_path = pair_path
 
     def __len__(self) -> int:

@@ -68,6 +68,9 @@ class PFITests(unittest.TestCase):
             self.assertIsNone(resolve_resume(None, tmp))
             (Path(tmp) / "latest.pt").touch()
             self.assertEqual(resolve_resume("auto", tmp), Path(tmp) / "latest.pt")
+            (Path(tmp) / "latest.pt.invalid-data.json").write_text('{}')
+            with self.assertRaisesRegex(ValueError, "invalid training data"):
+                resolve_resume("auto", tmp)
 
     def test_cached_garment_kv_matches_direct(self):
         m, x = tiny().eval(), inputs()
@@ -167,6 +170,18 @@ class PFITests(unittest.TestCase):
         for (iy0, iy1, ix0, ix1), (oy0, oy1, ox0, ox1) in _decode_windows(z, cloth, (64, 48), 4):
             self.assertEqual((iy1 - iy0, ix1 - ix0), (64, 48))
             self.assertTrue(0 <= oy0 <= iy0 and iy1 <= oy1 <= 128 and 0 <= ox0 <= ix0 and ix1 <= ox1 <= 96)
+
+    def test_same_resolution_weight_init_preserves_learned_positions(self):
+        import tempfile
+        source, target = tiny(), tiny()
+        with torch.no_grad():
+            source.pos_embed.fill_(0.37)
+            target.pos_embed.zero_()
+        with tempfile.NamedTemporaryFile(suffix=".pt") as f:
+            torch.save({"model": source.state_dict(), "config": {"model": {"latent_hw": [8, 6]}}}, f.name)
+            report = target.load_weights_any_resolution(f.name)
+        self.assertTrue(report["position_loaded"])
+        torch.testing.assert_close(target.pos_embed, source.pos_embed)
 
     def test_detail_branch_can_skip_resolution_shift(self):
         base = {"ltg_std": 0.6, "ltg_loc": 0.0, "ltg_scale": 1.0, "time_shift": 2.0, "curriculum": {

@@ -110,17 +110,21 @@ class VTONInpaintDiT(PatchForcingDiT):
         return {"loaded": len(compatible), "missing": list(result.missing_keys)}
 
     def load_weights_any_resolution(self, checkpoint_path: str) -> dict:
-        """Load a PFI checkpoint trained at another resolution (weights only).
+        """Load PFI weights, retaining learned positions at the same resolution.
 
-        Every parameter is resolution-independent except the fixed position
-        table, which is re-derived for the target grid by load_pretrained_pft
+        Every parameter is resolution-independent except the position table.
+        Across resolutions it is re-derived by load_pretrained_pft
         (``pos_embed`` mode). With "interpolate" the source and target models
         agree on the image-relative coordinate of every token.
         Call after load_pretrained_pft.
         """
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         state = dict(ckpt["model"] if "model" in ckpt else ckpt)
-        state.pop("pos_embed", None)
+        source_hw = ckpt.get("config", {}).get("model", {}).get("latent_hw")
+        position_loaded = ("pos_embed" in state and state["pos_embed"].shape == self.pos_embed.shape
+                           and (source_hw is None or tuple(source_hw) == self.latent_hw))
+        if not position_loaded:
+            state.pop("pos_embed", None)
         own = self.state_dict()
         bad = [k for k, v in state.items() if k in own and own[k].shape != v.shape]
         if bad:
@@ -129,7 +133,7 @@ class VTONInpaintDiT(PatchForcingDiT):
         missing = [k for k in result.missing_keys if k != "pos_embed"]
         if missing or result.unexpected_keys:
             raise ValueError(f"missing {missing[:5]} unexpected {result.unexpected_keys[:5]}")
-        return {"loaded": len(state), "source_step": ckpt.get("step")}
+        return {"loaded": len(state), "source_step": ckpt.get("step"), "position_loaded": position_loaded}
 
     @torch.no_grad()
     def init_garment_embedder(self) -> None:

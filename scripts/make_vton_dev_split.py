@@ -6,6 +6,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 from pathlib import Path
+import sys
+
+# Preserve direct-script usage as well as `python -m scripts.make_vton_dev_split`.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from vton_ext.pairs import read_pairs
 
 
 def stable_key(row: str, seed: int) -> bytes:
@@ -22,7 +27,7 @@ def main() -> None:
     args = parser.parse_args()
 
     source = Path(args.input)
-    rows = [line.strip() for line in source.read_text(encoding="utf-8").splitlines() if line.strip()]
+    rows = [f"{person} {garment}" for person, garment in read_pairs(source)]
     if not 0 < args.dev_size < len(rows):
         raise ValueError(f"dev-size must be between 1 and {len(rows) - 1}")
 
@@ -33,6 +38,8 @@ def main() -> None:
 
     fit_path = Path(args.fit_output)
     dev_path = Path(args.dev_output)
+    if fit_path.exists() or dev_path.exists():
+        raise FileExistsError("Keep existing split files; use prepare_pfi_pairs for an audited repair")
     fit_path.parent.mkdir(parents=True, exist_ok=True)
     dev_path.parent.mkdir(parents=True, exist_ok=True)
     fit_path.write_text("\n".join(fit_rows) + "\n", encoding="utf-8")

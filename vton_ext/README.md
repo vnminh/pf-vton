@@ -1,5 +1,10 @@
 # Patch Forcing VTON: V43 at 1024 × 768
 
+For the V46 migration/resume regression, see the
+[27 September audit and recovery instructions](../docs/v46_resume_regression_audit_20260927.md).
+The step-3000 run was resumed with incorrect garment pairs. Restore the historical
+paired split and a clean earlier checkpoint before continuing it.
+
 Run these commands from the **repository root**. V43 uses the released PFT-XL/2
 weights to initialize a new try-on model. It trains on native-resolution
 VITON-HD images with patch forcing, a DINOv3 correspondence teacher, and a
@@ -72,25 +77,33 @@ and extract it as a sibling of this repository:
 
 `train_fit_pairs.txt` and `train_dev_pairs.txt` are **local development** lists
 used by V43; they are not supplied by the original dataset. Create a fixed
-256-pair development split from the original training pairs, keeping the
-official test split untouched:
+256-pair development split from **matching person/cloth identities**, keeping
+the official test split untouched. Some archives' `train_pairs.txt` contains
+**unpaired** combinations. Splitting that file directly trains against an
+unrelated garment and invalidates paired reconstruction metrics.
 
 ```bash
-python - <<'PY'
-from pathlib import Path
-from random import Random
-
-root = Path('../high-resolution-viton-zalando-dataset')
-for name in ('train_fit_pairs.txt', 'train_dev_pairs.txt'):
-    assert not (root / name).exists(), f'Keep the existing split: {root / name}'
-rows = [line for line in (root / 'train_pairs.txt').read_text().splitlines() if line.strip()]
-assert len(rows) > 256, 'Expected the full VITON-HD training pair list'
-dev = set(Random(42).sample(range(len(rows)), 256))
-(root / 'train_fit_pairs.txt').write_text(''.join(f'{row}\n' for i, row in enumerate(rows) if i not in dev))
-(root / 'train_dev_pairs.txt').write_text(''.join(f'{row}\n' for i, row in enumerate(rows) if i in dev))
-print(f'{len(rows) - len(dev)} training pairs; {len(dev)} development pairs')
-PY
+python -m scripts.prepare_pfi_pairs \
+  --root ../high-resolution-viton-zalando-dataset --seed 2026 --method stable-hash --dev-size 256
+python -m scripts.prepare_pfi_pairs \
+  --root ../high-resolution-viton-zalando-dataset --check-only
 ```
+
+The generator sorts identities before selecting development rows. Its default
+hash method and seed 2026 reproduce the historical split from
+`scripts/make_vton_dev_split.py`, confirmed against the saved V42 preview targets.
+The earlier README's random seed-42 recipe changed both the split and its preview
+identities. Preserve an existing valid split when resuming another experiment;
+use `--method random --seed 42` only if that was the experiment's original recipe.
+It keeps the archive's original lists untouched and refuses to replace a
+different existing split. For an audited repair, `--replace` first backs up
+both existing lists. The dataset loader rejects mismatched person/garment
+identities in paired mode. New training checkpoints store fit/dev fingerprints
+and reject a resume with changed lists or row order; legacy checkpoints cannot
+verify their original split. Keep the exact fit/dev files with your backups.
+If an audit flags a checkpoint with `<checkpoint>.invalid-data.json`, the
+trainer refuses to resume it. Recover a verified clean checkpoint into a new
+run rather than continue the optimizer trained on incorrect garments.
 
 The loader expects the listed image, mask, DensePose, garment and human-parse
 folders under `train/`. If your dataset lives elsewhere, set `data.root` in

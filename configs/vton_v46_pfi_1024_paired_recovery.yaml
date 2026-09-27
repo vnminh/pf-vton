@@ -1,0 +1,13 @@
+# Clean recovery from the last retained pre-corruption V46 snapshot.
+# Restore paired lists using prepare_pfi_pairs (stable-hash, seed 2026) first.
+# The step-1500 snapshot has no optimizer: initialize weights in a NEW run.
+base_config: configs/vton_v46_pfi_1024_c2f.yaml
+
+weights:
+  init_from: logs/vton-v46-pfi-1024-c2f/step0001500.pt
+
+train:
+  output_dir: logs/vton-v46-pfi-1024-paired-recovery
+  # Bound disk use on the 81 GB instance while preserving full latest.pt.
+  keep_last: 4
+  min_free_gb: 24
