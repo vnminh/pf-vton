@@ -6,7 +6,7 @@ import unittest
 
 import torch
 
-from scripts.audit_pfi_timesteps import ObservedModel, as_float, contrast_mask, per_image_mean, plot_profiles, rgb_metrics, summarize
+from scripts.audit_pfi_timesteps import ObservedModel, as_float, contrast_mask, per_image_mean, plot_profiles, profile_time, rgb_metrics, summarize
 from scripts.compare_pfi_audits import bin_time_rows, paired_summary
 from vton_ext.pfi_sample import generate
 from vton_ext.utils import expand_patch_values
@@ -23,6 +23,12 @@ class ConstantVelocity:
 
 
 class AuditTests(unittest.TestCase):
+    def test_profile_time_matches_shifted_sampler_grid(self):
+        self.assertEqual(profile_time(4, 8, 1.0), 0.5)
+        self.assertAlmostEqual(profile_time(4, 8, 2.0), 1 / 3, places=6)
+        self.assertEqual(profile_time(0, 50, 2.0), 0.0)
+        self.assertEqual(profile_time(50, 50, 2.0), 1.0)
+
     def test_observer_does_not_change_generation(self):
         model = ConstantVelocity()
         edit = torch.zeros(2, 12, dtype=torch.bool)

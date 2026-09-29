@@ -22,7 +22,8 @@ from torch.utils.data import DataLoader, Subset
 from torchmetrics.functional.image import structural_similarity_index_measure
 from torchvision.utils import save_image
 
-from vton_ext.pfi_sample import composite, generate, load_for_inference, prepare_inputs
+from vton_ext.pfi_sample import composite, generate, load_for_inference, prepare_inputs, shift_time
+from vton_ext.pairs import split_manifest, validate_resume_pairs
 from vton_ext.pfi_train import load_cfg, make_dataset
 from vton_ext.utils import expand_patch_values
 from vton_ext.vae import decode_latents, encode_images, load_sd_vae
@@ -71,6 +72,11 @@ def rgb_metrics(pred, target, masks, include_ssim=False):
 def as_float(value):
     result = float(value)
     return result if np.isfinite(result) else None
+
+
+def profile_time(call, nfe, time_shift):
+    """Actual synchronous token time, including the inference grid shift."""
+    return round(float(shift_time(call / nfe, time_shift)), 6)
 
 
 class ObservedModel:
@@ -162,6 +168,14 @@ def run(args):
         raise FileExistsError(f"A completed audit already exists: {output}")
     device = torch.device(args.device)
     model, step = load_for_inference(cfg, args.checkpoint, device)
+    time_shift = args.time_shift if args.time_shift is not None else float(
+        cfg.eval.get("time_shift", getattr(model, "time_shift", 1.0)))
+    seam_px = float(cfg.eval.get("seam_px", 0.0))
+    feather_px = float(cfg.eval.get("feather_px", 0.0))
+    pairs = split_manifest(Path(cfg.data.pairs_file), Path(cfg.data.test_pairs_file))
+    checkpoint_metadata = torch.load(args.checkpoint, map_location="cpu", weights_only=False, mmap=True)
+    validate_resume_pairs(checkpoint_metadata.get("data_pairs"), pairs)
+    del checkpoint_metadata
     vae = load_sd_vae(cfg.weights.vae, device)
     dataset = make_dataset(cfg, cfg.data.test_pairs_file, augment=False)
     indices = list(range(len(dataset))) if args.indices is None else args.indices
@@ -179,7 +193,7 @@ def run(args):
         others = [i for i in indices if i not in featured]
         rng = np.random.default_rng(args.seed)
         chosen = rng.choice(others, size=args.profile_count - len(featured), replace=False).tolist()
-        profile_indices = sorted(featured + chosen)
+        profile_indices = featured + sorted(chosen)
         # Keep profiled batches together; per-case noise and paired statistics
         # stay unchanged, while the extra teacher/decoder work runs on only a
         # representative 64-case subset rather than every long sample.
@@ -195,6 +209,8 @@ def run(args):
         "profile_samplers": [f"euler{n}" for n in (8, 50) if f"euler:{n}" in args.samplers],
         "metric_weighting": "equal per image; empty regions excluded with explicit counts",
         "rgb_range": [-1, 1], "cfg_scale": 1.0,
+        "time_shift": time_shift, "seam_px": seam_px, "feather_px": feather_px,
+        "data_pairs": pairs, "torch_version": str(torch.__version__),
         "notes": [
             "contrast is a color-deviation proxy, not text recognition",
             "teacher states contain ground-truth signal; endpoint error shrinks mechanically with remaining time",
@@ -226,11 +242,13 @@ def run(args):
                 for i in case_indices
             ])
             originals = {"garment": batch["garment"].to(device), "target": target,
-                         "vae": decode_latents(vae, truth).clamp(-1, 1)}
+                         "vae": decode_latents(vae, truth)}
             outputs = {}
 
-            def append_rows(metrics, common, destination, handle):
+            def append_rows(metrics, common, destination, handle, selected_indices=None):
                 for j, index in enumerate(case_indices):
+                    if selected_indices is not None and index not in selected_indices:
+                        continue
                     row = {"index": index, "person_name": batch["person_name"][j], **common,
                            **{k: as_float(v[j]) for k, v in metrics.items()}}
                     destination.append(row)
@@ -254,11 +272,12 @@ def run(args):
                     # This observer profiles synchronous Euler only. Use its
                     # exact grid position to avoid splitting groups by float
                     # reduction noise for different mask sizes/batch partitions.
-                    mean_time = round(call / nfe, 6)
+                    mean_time = profile_time(call, nfe, time_shift)
                     for state, sx, sv, slv in [("rollout", x, v, logvar), ("teacher", teacher_x, tv, tlv)]:
                         endpoint = torch.where(inputs["edit_pixels"].bool(), sx.float() + (1 - tpix) * sv.float(), inputs["known"])
                         with torch.autocast(device.type, enabled=False):
-                            rgb = composite(decode_latents(vae, endpoint.float()), inputs["agnostic_rgb"], inputs["pixel_mask"])
+                            rgb = composite(decode_latents(vae, endpoint.float()), inputs["agnostic_rgb"], inputs["pixel_mask"],
+                                            seam_px=seam_px, feather_px=feather_px)
                             measures = rgb_metrics(rgb, target, masks)
                         measures["latent_cloth_endpoint_l1"] = per_image_mean((endpoint - truth).abs(), latent_cloth)
                         if state == "teacher":
@@ -272,14 +291,17 @@ def run(args):
                             corr = spearmanr(u, e).statistic if len(u) > 2 and np.ptp(u) > 0 and np.ptp(e) > 0 else np.nan
                             correlations.append(corr)
                         measures["uncertainty_spearman"] = correlations
-                        append_rows(measures, {"sampler": key, "state": state, "time": mean_time, "call": call}, profile_rows, time_file)
+                        append_rows(measures, {"sampler": key, "state": state, "time": mean_time, "call": call},
+                                    profile_rows, time_file, selected_indices=profile_set)
 
                 wrapped = ObservedModel(model, observer) if profile else model
                 with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
                     latent, stats = generate(wrapped, inputs, nfe=nfe, sampler=sampler,
-                                             p=float(cfg.eval.p), n_inner=int(cfg.eval.n_inner), noise=noise, return_stats=True)
+                                             p=float(cfg.eval.p), n_inner=int(cfg.eval.n_inner), noise=noise,
+                                             return_stats=True, time_shift=time_shift)
                 assert stats["nfe"] == nfe
-                rgb = composite(decode_latents(vae, latent.float()), inputs["agnostic_rgb"], inputs["pixel_mask"])
+                rgb = composite(decode_latents(vae, latent.float()), inputs["agnostic_rgb"], inputs["pixel_mask"],
+                                seam_px=seam_px, feather_px=feather_px)
                 outputs[key] = rgb
                 measures = rgb_metrics(rgb, target, masks, include_ssim=True)
                 append_rows(measures, {"sampler": key, "nfe": nfe}, final_rows, final_file)
@@ -301,7 +323,8 @@ def run(args):
     final_summary = summarize(final_rows, ["sampler"])
     time_summary = summarize(profile_rows, ["sampler", "state", "time"])
     (output / "summary.json").write_text(json.dumps({"final": final_summary, "time": time_summary}, indent=2, allow_nan=False) + "\n")
-    plot_profiles(time_summary, output / "time-errors.png", f"PFI step {step}: {len(indices)} paired dev cases")
+    plot_profiles(time_summary, output / "time-errors.png",
+                  f"PFI step {step}: {len(profile_indices)} profiled of {len(indices)} paired dev cases")
     (output / "complete.json").write_text(json.dumps({"step": step, "num_cases": len(indices), "elapsed_seconds": time.monotonic() - started}, indent=2) + "\n")
 
 
@@ -313,6 +336,7 @@ def main():
     p.add_argument("--device", default="cuda")
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--seed", type=int, default=12345)
+    p.add_argument("--time-shift", type=float, help="Inference grid shift; defaults to cfg.eval.time_shift")
     p.add_argument("--num-samples", type=int, default=0)
     p.add_argument("--profile-count", type=int, default=64,
                    help="Number of cases for expensive teacher/rollout time profiles; 0 profiles all, -1 skips")

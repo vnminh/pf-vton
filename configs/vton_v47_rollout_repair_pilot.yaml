@@ -1,0 +1,47 @@
+# Controlled continuation from the paired V46 step-8250 weights. This pilot
+# tests whether supervising states reached by the dual-loop sampler reduces drift.
+base_config: configs/vton_v46_pfi_1024_paired_recovery.yaml
+
+weights:
+  init_from: checkpoints/pfi-audit/v46-recovery-step0008250-resume.pt
+
+flow:
+  curriculum:
+    # Preserve V46's final training-time mixture when starting a fresh run.
+    start: {pure_noise: 0.10, synchronous: 0.15, detail: 0.40}
+    end: {pure_noise: 0.10, synchronous: 0.15, detail: 0.40}
+    ltg_loc_start: 0.8
+    ltg_loc_end: 0.8
+
+rollout:
+  enabled: true
+  probability: 0.25
+  nfe: 8
+  n_inner: 2
+  p: 0.7
+  time_shift: 1.0
+  min_calls: 2
+  max_calls: 7
+  latent_weight: 0.10
+  decoded_weight: 0.50
+
+optim:
+  lr: 1.6e-5
+  pretrained_lr_multiplier: 0.5  # 8e-6 on the PFT backbone
+  warmup_steps: 50
+
+train:
+  output_dir: logs/vton-v47-rollout-repair-pilot
+  batch_size: 4
+  gradient_accumulation_steps: 2
+  max_steps: 2000                 # LR horizon; do not collapse cosine for pilot
+  stop_at_step: 500
+  save_first_step: 10
+  save_every: 125
+  keep_every: 2000               # no weight-only snapshots during the pilot
+  require_pair_fingerprints: true
+
+eval:
+  at_start: true
+  every: 125
+  batch_size: 4

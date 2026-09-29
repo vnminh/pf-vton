@@ -31,7 +31,8 @@ from vton_ext.coral import DINOv3CoralTeacher, coral_routing_loss
 from vton_ext.data import VitonHDDataset
 from vton_ext.pairs import split_manifest, validate_resume_pairs
 from vton_ext.pfi_model import VTONInpaintDiT
-from vton_ext.pfi_sample import composite, generate, prepare_inputs, shift_time
+from vton_ext.pfi_sample import (composite, generate, prepare_inputs, shift_time,
+                                 token_uncertainty, uncertain_tokens)
 from vton_ext.utils import expand_patch_values, pool_valid_mask, seed_everything
 from vton_ext.vae import decode_latents, decode_latents_with_grad, load_sd_vae
 
@@ -76,6 +77,20 @@ def validate_config(cfg):
         raise ValueError("image_hw must be 8 * latent_hw; latent dimensions must divide by patch_size")
     if int(cfg.train.batch_size) < 1 or int(cfg.train.gradient_accumulation_steps) < 1:
         raise ValueError("Training batch size and accumulation must be positive")
+    rcfg = cfg.get("rollout")
+    if rcfg and bool(rcfg.get("enabled", False)):
+        if not 0 <= float(rcfg.probability) <= 1:
+            raise ValueError("rollout.probability must be in [0,1]")
+        if not 0 < int(rcfg.min_calls) <= int(rcfg.max_calls) < int(rcfg.nfe):
+            raise ValueError("rollout calls must satisfy 0 < min <= max < nfe")
+        if int(rcfg.nfe) % int(rcfg.n_inner) or int(rcfg.n_inner) < 2:
+            raise ValueError("rollout.nfe must divide by rollout.n_inner >= 2")
+        if not 0 < float(rcfg.p) < 1 or float(rcfg.time_shift) <= 0:
+            raise ValueError("rollout.p must be in (0,1) and time_shift positive")
+        if float(rcfg.latent_weight) < 0 or float(rcfg.decoded_weight) < 0:
+            raise ValueError("rollout loss weights must be nonnegative")
+        if not float(rcfg.latent_weight) + float(rcfg.decoded_weight) > 0:
+            raise ValueError("at least one rollout loss weight must be positive")
 
 
 def resolve_resume(resume, output_dir):
@@ -217,6 +232,21 @@ def _rgb_highpass(rgb: torch.Tensor) -> torch.Tensor:
     return rgb - F.avg_pool2d(F.pad(rgb, (2, 2, 2, 2), mode="reflect"), 5, 1)
 
 
+def graphic_saliency(rgb: torch.Tensor, garment_mask: torch.Tensor) -> torch.Tensor:
+    """(B,1,H,W) soft map of pixels that differ from the garment's base colour.
+
+    Target-derived weighting for logos, text and prints (distance from the
+    per-image median colour inside ``garment_mask``). Never an inference input.
+    """
+    bases = []
+    for img, v in zip(rgb, garment_mask):
+        use = v[0] > 0.5
+        bases.append(img[:, use].median(1).values if use.any() else img.new_zeros(3))
+    base = torch.stack(bases)[:, :, None, None]
+    distance = (rgb - base).square().mean(1, keepdim=True).sqrt()
+    return torch.sigmoid((distance - 0.16) / 0.035)
+
+
 def _decode_windows(endpoint, clothing_mask, crop, margin, factor=8):
     """Latent windows (y0, y1, x0, x1) centred on each image's clothing, plus
     ``margin`` latents of decoder context on each side where the image allows."""
@@ -281,14 +311,7 @@ def decoded_detail_loss(vae, endpoint, target, clothing_mask, edit_mask, cfg, se
         for pred, tr, cl, ed, valid in parts:
             mask = cl * ed
             if boost:
-                bases = []
-                for rgb, v in zip(tr, cl):
-                    use = v[0] > 0.5
-                    bases.append(rgb[:, use].median(1).values if use.any() else rgb.new_zeros(3))
-                base = torch.stack(bases)[:, :, None, None]
-                distance = (tr - base).square().mean(1, keepdim=True).sqrt()
-                saliency = torch.sigmoid((distance - 0.16) / 0.035).detach()
-                mask = mask * (1.0 + boost * saliency)
+                mask = mask * (1.0 + boost * graphic_saliency(tr, cl).detach())
             hp_err = (_rgb_highpass(pred) - _rgb_highpass(tr)).abs()
             mask = (mask * valid).expand_as(pred)
             num_rgb = num_rgb + ((pred - tr).abs() * mask).sum()
@@ -323,6 +346,34 @@ def prune_snapshots(out_dir: Path, keep_last: int) -> list:
     for p in doomed:
         p.unlink()
     return doomed
+
+
+def detail_sampling_weights(rows, scores: dict, boost: float, reference: float) -> torch.Tensor:
+    """Per-row sampling weight 1 + boost * min(score / reference, 1).
+
+    ``scores`` maps a garment file name to the fraction of its pixels that are
+    graphics/text (scripts/score_garment_detail.py). Missing garments get 1.
+    """
+    if boost < 0 or reference <= 0:
+        raise ValueError("detail_sampling needs boost >= 0 and reference > 0")
+    s = torch.tensor([float(scores.get(g, 0.0)) for _, g in rows])
+    return 1.0 + boost * (s / reference).clamp(0, 1)
+
+
+def detail_sampler(train_ds, cfg):
+    """Oversample garments with prints/text; None keeps plain shuffling."""
+    dcfg = cfg.data.get("detail_sampling")
+    if not dcfg or not bool(dcfg.get("enabled", False)):
+        return None
+    scores = json.loads(Path(dcfg.scores).read_text())
+    weights = detail_sampling_weights(train_ds.rows, scores, float(dcfg.boost), float(dcfg.reference))
+    known = sum(g in scores for _, g in train_ds.rows)
+    if known < len(train_ds.rows):
+        raise ValueError(f"detail scores cover {known}/{len(train_ds.rows)} training garments")
+    share = float((weights > 1.5).float().mean())
+    print(f"detail sampling: mean weight {float(weights.mean()):.3f}, {share:.1%} of garments boosted >1.5x",
+          flush=True)
+    return torch.utils.data.WeightedRandomSampler(weights.double(), len(weights), replacement=True)
 
 
 def infinite(loader):
@@ -434,6 +485,99 @@ def training_loss(model, teacher, vae, batch, cfg, time_sampler, device, step: i
     return loss, metrics
 
 
+@torch.no_grad()
+def short_dual_loop_rollout(model, inputs: dict, calls: int, nfe: int = 8,
+                            n_inner: int = 2, p: float = 0.7, time_shift: float = 1.0,
+                            noise: torch.Tensor | None = None):
+    """Return the exact partial state after `calls` dual-loop model calls.
+
+    The garment and observed person context are kept as in inference. Gradients
+    are deliberately stopped through the rollout; only its endpoint correction
+    receives training gradients.
+    """
+    if not 0 < calls <= nfe or nfe % n_inner or n_inner < 2:
+        raise ValueError("rollout calls must be within nfe and nfe divisible by n_inner >= 2")
+    edit, edit_pix = inputs["edit_tokens"], inputs["edit_pixels"]
+    known = inputs["known"]
+    x = torch.where(edit_pix.bool(), torch.randn_like(known) if noise is None else noise, known).float()
+    t = torch.where(edit, 0.0, 1.0).to(known.dtype)
+    garment_kv = model.encode_garment(inputs["garment"], inputs["garment_mask"])
+    levels = shift_time(torch.linspace(0, 1, nfe // n_inner + 1, device=known.device), time_shift)
+    count = 0
+
+    def advance(state, times, velocity, dt_tok):
+        dt_tok = dt_tok * edit
+        return (state + expand_patch_values(dt_tok, model.patch_size, model.latent_hw) * velocity,
+                (times + dt_tok).clamp(max=1.0))
+
+    for i in range(nfe // n_inner):
+        dt = float(levels[i + 1] - levels[i])
+        v, logvar = model(x, t, inputs["cond"], edit, garment_kv=garment_kv,
+                          return_uncertainty=True)
+        hard = uncertain_tokens(token_uncertainty(logvar, model.patch_size), edit, p)
+        step = torch.where(hard, dt / n_inner, dt)
+        x, t = advance(x, t, v.float(), step)
+        count += 1
+        if count == calls:
+            return x.detach(), t.detach()
+        for _ in range(n_inner - 1):
+            v = model(x, t, inputs["cond"], edit, garment_kv=garment_kv).float()
+            x, t = advance(x, t, v, hard.to(t.dtype) * (dt / n_inner))
+            count += 1
+            if count == calls:
+                return x.detach(), t.detach()
+    raise AssertionError("unreachable rollout call count")
+
+
+def rollout_endpoint_loss(model, vae, batch, cfg, device):
+    """Supervise an endpoint predicted from a state reached by inference.
+
+    A randomly selected paired example is rolled out for configured calls of the eight
+    inference steps. The model then predicts the clean endpoint from that state,
+    with full decoded garment RGB/high-pass loss and an editable clothing-latent
+    anchor. This complements the ordinary straight-interpolation flow loss.
+    """
+    rcfg = cfg.rollout
+    b = batch["image"].shape[0]
+    j = int(torch.randint(b, (1,), device=device))
+    example = {k: v[j:j + 1] for k, v in batch.items() if torch.is_tensor(v)}
+    calls = int(torch.randint(int(rcfg.min_calls), int(rcfg.max_calls) + 1, (1,), device=device))
+    # Keep no-grad rollout casts out of the gradient-bearing autocast cache.
+    # Reusing those casts can make checkpoint recomputation save different
+    # tensors from the forward pass on CUDA.
+    with torch.no_grad(), torch.autocast(device.type, dtype=torch.bfloat16,
+                                         enabled=device.type == "cuda"):
+        open_px = int(torch.randint(int(cfg.data.mask_open_px_range[0]),
+                                    int(cfg.data.mask_open_px_range[1]) + 1, (1,), device=device))
+        inputs = prepare_inputs(vae, example, model, device, mask_open_px=open_px)
+        from vton_ext.vae import encode_images
+        truth = encode_images(vae, example["image"].to(device)).float()
+        x, t = short_dual_loop_rollout(
+            model, inputs, calls, nfe=int(rcfg.nfe), n_inner=int(rcfg.n_inner),
+            p=float(rcfg.p), time_shift=float(rcfg.time_shift),
+        )
+
+    edit_pix = inputs["edit_pixels"]
+    t_pix = expand_patch_values(t, model.patch_size, model.latent_hw)
+    with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+        v = model(x, t, inputs["cond"], inputs["edit_tokens"],
+                  garment_latent=inputs["garment"], garment_mask=inputs["garment_mask"]).float()
+    endpoint = torch.where(edit_pix.bool(), x + (1 - t_pix) * v, inputs["known"])
+    clothing = F.adaptive_avg_pool2d(example["clothing_mask"].to(device).float(), model.latent_hw)
+    latent_mask = clothing * edit_pix
+    latent_loss = masked_mean((endpoint - truth).abs(), latent_mask)
+    decoded_loss, decoded_metrics = decoded_detail_loss(
+        vae, endpoint, example["image"].to(device), example["clothing_mask"].to(device),
+        inputs["pixel_mask"], cfg, torch.ones(1, device=device, dtype=torch.bool),
+    )
+    total = float(rcfg.latent_weight) * latent_loss + float(rcfg.decoded_weight) * decoded_loss
+    return total, {"rollout_loss": total.detach(), "rollout_latent_l1": latent_loss.detach(),
+                   "rollout_decoded_rgb": decoded_metrics["loss_decoded_rgb"].detach(),
+                   "rollout_decoded_highpass": decoded_metrics["loss_decoded_highpass"].detach(),
+                   "rollout_time": t[inputs["edit_tokens"]].mean().detach(),
+                   "rollout_calls": float(calls)}
+
+
 # ----------------------------------------------------------------- preview
 
 @torch.no_grad()
@@ -470,6 +614,12 @@ def evaluate(model, vae, batches, cfg, device, out_dir: Path, step: int) -> dict
             err = (rgb - target).abs().mean(1, keepdim=True)
             results.setdefault(f"{key}_mask_l1", []).append(float(masked_mean(err, mask)))
             results.setdefault(f"{key}_cloth_l1", []).append(float(masked_mean(err, cloth)))
+            # Detail-sensitive scores: plain L1 prefers blur, so also track the
+            # error on the garment's graphics/text and on its high frequencies.
+            graphic = cloth * graphic_saliency(target, cloth)
+            results.setdefault(f"{key}_graphic_l1", []).append(float(masked_mean(err, graphic)))
+            hp = (_rgb_highpass(rgb) - _rgb_highpass(target)).abs().mean(1, keepdim=True)
+            results.setdefault(f"{key}_cloth_hp", []).append(float(masked_mean(hp, cloth)))
             row.append(rgb)
         rows.append(torch.stack(row, 1).flatten(0, 1).cpu())
     grid = torch.cat(rows)
@@ -553,7 +703,9 @@ def main(argv=None):
         print(f"resumed {resume} at step {step}")
         del ckpt
 
-    loader = DataLoader(train_ds, batch_size=int(cfg.train.batch_size), shuffle=True, drop_last=True,
+    sampler = detail_sampler(train_ds, cfg)
+    loader = DataLoader(train_ds, batch_size=int(cfg.train.batch_size), shuffle=sampler is None,
+                        sampler=sampler, drop_last=True,
                         num_workers=int(cfg.data.num_workers), pin_memory=True,
                         persistent_workers=int(cfg.data.num_workers) > 0)
     dev_ds = Subset(dev_base, list(cfg.eval.indices))
@@ -602,6 +754,19 @@ def main(argv=None):
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 loss, metrics = training_loss(model, teacher, vae, batch, cfg, time_sampler, device, step)
             (loss / accum).backward()
+            # Backpropagate separately so the full primary training graph is
+            # released before the extra rollout and decoder graphs are built.
+            del loss
+            metrics = {k: v.detach() if torch.is_tensor(v) else v for k, v in metrics.items()}
+            rcfg = cfg.get("rollout")
+            rollout_selected = bool(rcfg and rcfg.get("enabled", False) and
+                                    torch.rand((), device=device) < float(rcfg.probability))
+            metrics["rollout_selected"] = float(rollout_selected)
+            if rollout_selected:
+                auxiliary, rollout_metrics = rollout_endpoint_loss(model, vae, batch, cfg, device)
+                (auxiliary / accum).backward()
+                metrics.update(rollout_metrics)
+                del auxiliary
             for k, v in metrics.items():
                 step_metrics.setdefault(k, []).append(float(v.detach()) if torch.is_tensor(v) else float(v))
         step_metrics = {k: sum(v) / len(v) for k, v in step_metrics.items()}

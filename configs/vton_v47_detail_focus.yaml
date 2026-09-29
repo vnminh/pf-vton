@@ -1,0 +1,79 @@
+# V47: continue the paired V46 recovery from update 8250 with more garment-detail signal.
+#
+#   bash scripts/run_pfi_v47_detail_focus.sh
+#
+# Why V46 stopped improving (update 3500 -> 8250, 8 fixed dev cases, dual-loop 8):
+#  * clothing L1 stayed at 0.162-0.190 with no trend; flow loss is flat once the
+#    coarse-to-fine curriculum saturated at 6000; LR had decayed to 3e-6.
+#  * The audit (docs/v46_step8250_failure_diagnosis_20260929.md) found dual-loop
+#    8 < Euler 8 < Euler 50 in L1. That ordering is what a healthy sampler gives:
+#    more steps commit to sharper samples, which L1 and high-pass L1 punish
+#    whenever a detail is uncertain. It is not evidence of rollout drift.
+#  * Garment CFG 1 -> 3 on update 8250 sharpens strokes but never fixes letter
+#    identity (Lee -> "Leo", GAP -> "GAR" at every scale): the person tokens do
+#    not receive the fine garment information, so sampling cannot recover it.
+#  * The only direct garment-reading signal is weak: CoRAL weight 0.1, local
+#    mass 0.32 -> 0.34 in 5000 updates. Letters are a small share of pixels and
+#    garments; decoded detail loss reached ~15% of image exposures.
+# Changes (all else as V46):
+#  1. Oversample printed/logo/text garments (data.detail_sampling, scores from
+#     scripts/score_garment_detail.py): score >= 0.10 (~top 30%) drawn 3x.
+#  2. CoRAL weight 0.1 -> 0.3 to sharpen person->garment correspondence.
+#  3. Decoded RGB/high-pass loss on every eligible late-t microbatch (p 1.0,
+#     still one image per microbatch, so the same memory).
+#  4. LR warm restart: 1e-5 backbone / 2e-5 new, 200 warmup, 6000-update cosine,
+#     from the update-8250 weights with a fresh optimizer; curriculum held at
+#     V46's final mixture.
+#  5. Eval adds graphic-region L1 and clothing high-pass L1 (detail-sensitive).
+# Rollout repair (Codex's V47 pilot, rollout.enabled) stays off: see the second
+# bullet, and its checkpointed backward failed on CUDA.
+base_config: configs/vton_v46_pfi_1024_paired_recovery.yaml
+
+weights:
+  init_from: checkpoints/pfi-audit/v46-recovery-step0008250-resume.pt
+
+data:
+  detail_sampling:
+    enabled: true
+    scores: checkpoints/garment_detail_scores.json
+    boost: 2.0
+    reference: 0.10
+
+flow:
+  curriculum:
+    start: {pure_noise: 0.10, synchronous: 0.15, detail: 0.40}
+    end: {pure_noise: 0.10, synchronous: 0.15, detail: 0.40}
+    ltg_loc_start: 0.8
+    ltg_loc_end: 0.8
+
+coral:
+  weight: 0.30
+
+loss:
+  decoded_probability: 1.0
+
+rollout:
+  enabled: false
+
+optim:
+  lr: 2.0e-5
+  pretrained_lr_multiplier: 0.5
+  warmup_steps: 200
+
+train:
+  output_dir: logs/vton-v47-detail-focus
+  max_steps: 6000
+  save_first_step: 10
+  save_every: 250
+  keep_every: 1000
+  keep_last: 1
+  min_free_gb: 12
+  require_pair_fingerprints: true
+
+eval:
+  at_start: true
+  every: 250
+  batch_size: 4
+  samplers:
+    - {name: dual_loop, nfe: 8, time_shift: 1.0}
+    - {name: dual_loop, nfe: 8, time_shift: 1.0, cfg: 2.0}

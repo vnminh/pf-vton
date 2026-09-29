@@ -10,7 +10,9 @@ from vton_ext.pfi_model import VTONInpaintDiT
 from omegaconf import OmegaConf
 
 from vton_ext.pfi_sample import generate, open_mask, shift_time
-from vton_ext.pfi_train import EditTimeSampler, decoded_detail_loss, load_cfg, lr_factor, resolve_resume, validate_config
+from vton_ext.pfi_train import (EditTimeSampler, decoded_detail_loss, load_cfg, lr_factor,
+                                resolve_resume, rollout_endpoint_loss, short_dual_loop_rollout,
+                                validate_config)
 from vton_ext.utils import expand_patch_values
 
 
@@ -36,6 +38,75 @@ def inputs(b=2):
 
 
 class PFITests(unittest.TestCase):
+    def test_rollout_endpoint_loss_backpropagates_to_person_and_garment(self):
+        class TinyVAE(torch.nn.Module):
+            scale, shift = 1.0, 0.0
+
+            def __init__(self):
+                super().__init__()
+                self.post_quant_conv = torch.nn.Identity()
+                self.decoder = torch.nn.Sequential(torch.nn.Upsample(scale_factor=8, mode="nearest"))
+
+            def encode(self, rgb):
+                return F.avg_pool2d(torch.cat([rgb, rgb.mean(1, keepdim=True)], 1), 8)
+
+        class ThreeChannelDecoder(torch.nn.Module):
+            def forward(self, z):
+                return F.interpolate(z[:, :3], scale_factor=8, mode="nearest")
+
+        model, vae = tiny().train(), TinyVAE()
+        model.gradient_checkpointing = True
+        vae.decoder = ThreeChannelDecoder()
+        mask = torch.zeros(2, 1, 64, 48)
+        mask[:, :, 8:56, 8:40] = 1
+        batch = {"image": torch.randn(2, 3, 64, 48),
+                 "agnostic": torch.randn(2, 3, 64, 48),
+                 "densepose": torch.randn(2, 3, 64, 48),
+                 "garment": torch.randn(2, 3, 64, 48),
+                 "agnostic_mask": mask,
+                 "clothing_mask": mask,
+                 "garment_mask": mask}
+        cfg = OmegaConf.create({"data": {"mask_open_px_range": [0, 0]},
+                                "rollout": {"nfe": 8, "n_inner": 2, "p": 0.7,
+                                            "time_shift": 1.0, "min_calls": 1, "max_calls": 2,
+                                            "latent_weight": 0.1, "decoded_weight": 0.5},
+                                "loss": {"decoded_rgb_weight": 0.5,
+                                         "decoded_highpass_weight": 2.0,
+                                         "decoded_graphic_boost": 2.0,
+                                         "decoded_checkpoint": False,
+                                         "decoded_crop_latent": None}})
+        torch.manual_seed(11)
+        loss, metrics = rollout_endpoint_loss(model, vae, batch, cfg, torch.device("cpu"))
+        self.assertTrue(torch.isfinite(loss))
+        self.assertTrue(all(torch.isfinite(torch.as_tensor(v)) for v in metrics.values()))
+        loss.backward()
+        self.assertGreater(float(model.blocks[0].attn.qkv.weight.grad.abs().sum()), 0)
+        self.assertGreater(float(model.garment_embedder.weight.grad.abs().sum()), 0)
+
+    def test_short_rollout_matches_dual_loop_and_retains_known_latents(self):
+        class UnitVelocity:
+            patch_size, latent_hw = 2, (8, 6)
+
+            def encode_garment(self, garment, mask):
+                return []
+
+            def __call__(self, x, t, cond, edit, **kwargs):
+                v = torch.ones_like(x)
+                return (v, torch.zeros_like(x[:, :1])) if kwargs.get("return_uncertainty") else v
+
+        x = inputs()
+        noise = torch.randn_like(x["known"])
+        state, time = short_dual_loop_rollout(UnitVelocity(), x, calls=3, noise=noise)
+        keep = ~x["edit_pixels"].bool().expand_as(state)
+        torch.testing.assert_close(state[keep], x["known"][keep])
+        done, _ = short_dual_loop_rollout(UnitVelocity(), x, calls=8, noise=noise)
+        expected = generate(UnitVelocity(), x, nfe=8, sampler="dual_loop", noise=noise,
+                            time_shift=1.0)
+        torch.testing.assert_close(done, expected)
+        self.assertTrue((time[x["edit_tokens"]] <= 0.5).all())
+        with self.assertRaises(ValueError):
+            short_dual_loop_rollout(UnitVelocity(), x, calls=9)
+
     def test_coral_checkpointed_loss_matches_gradients(self):
         torch.manual_seed(12)
         coords = torch.rand(2, 12, 2)
@@ -308,6 +379,20 @@ class PFITests(unittest.TestCase):
         self.assertLess(float(early.mean()), 0.3)
         self.assertGreater(float(late.mean()), float(early.mean()) + 0.25)
         self.assertLess(float((early > 0.8).float().mean()), 0.05)
+
+    def test_detail_sampling_weights_and_graphic_saliency(self):
+        from vton_ext.pfi_train import detail_sampling_weights, graphic_saliency
+        rows = [("a.jpg", "plain.jpg"), ("b.jpg", "logo.jpg"), ("c.jpg", "half.jpg"), ("d.jpg", "unknown.jpg")]
+        w = detail_sampling_weights(rows, {"plain.jpg": 0.0, "logo.jpg": 0.4, "half.jpg": 0.05}, boost=2.0,
+                                    reference=0.1)
+        torch.testing.assert_close(w, torch.tensor([1.0, 3.0, 2.0, 1.0]))
+        with self.assertRaises(ValueError):
+            detail_sampling_weights(rows, {}, boost=1.0, reference=0.0)
+        rgb = torch.full((1, 3, 8, 8), 0.9)
+        rgb[..., 2:4, 2:6] = -0.8  # dark print on a white shirt
+        sal = graphic_saliency(rgb, torch.ones(1, 1, 8, 8))
+        self.assertGreater(float(sal[..., 2:4, 2:6].min()), 0.99)
+        self.assertLess(float(sal[..., 5:, :].max()), 0.02)
 
     def test_open_mask_per_sample_radius(self):
         m = torch.zeros(2, 1, 21, 21)
