@@ -30,7 +30,7 @@ from patch_flow.timestep_schedules import LogitNormalTruncatedGaussian
 from vton_ext.coral import DINOv3CoralTeacher, coral_routing_loss
 from vton_ext.data import VitonHDDataset
 from vton_ext.pairs import split_manifest, validate_resume_pairs
-from vton_ext.pfi_model import VTONInpaintDiT
+from vton_ext.pfi_model import FINE_PARAMETERS, VTONInpaintDiT
 from vton_ext.pfi_sample import (composite, generate, prepare_inputs, shift_time,
                                  token_uncertainty, uncertain_tokens)
 from vton_ext.utils import expand_patch_values, pool_valid_mask, seed_everything
@@ -56,6 +56,7 @@ def build_model(cfg, load_pretrained: bool = True) -> VTONInpaintDiT:
         coral_heads=int(m.coral_heads),
         pos_embed=str(m.get("pos_embed", "interpolate")),
         pos_embed_trainable=bool(m.get("pos_embed_trainable", False)),
+        fine_garment_from=m.get("fine_garment_from"),
     )
     model.time_shift = float(cfg.flow.get("time_shift", 1.0))
     if load_pretrained:
@@ -70,6 +71,12 @@ def build_model(cfg, load_pretrained: bool = True) -> VTONInpaintDiT:
 
 def validate_config(cfg):
     image_hw, latent_hw = tuple(cfg.model.image_hw), tuple(cfg.model.latent_hw)
+    acfg = cfg.get("attn_flow")
+    if acfg and float(acfg.get("weight", 0.0)) > 0:
+        if not all(0 <= int(i) < int(cfg.model.get("depth", 28)) for i in acfg.blocks) or not acfg.blocks:
+            raise ValueError("attn_flow.blocks must be a non-empty list of block indices")
+        if float(acfg.get("spread_weight", 0.0)) < 0 or not 0 <= float(acfg.get("min_t", 0.0)) <= 1:
+            raise ValueError("attn_flow.spread_weight must be >= 0 and min_t in [0, 1]")
     patch = int(cfg.model.patch_size)
     if len(image_hw) != 2 or len(latent_hw) != 2 or patch <= 0:
         raise ValueError("Expected two image/latent dimensions and a positive patch size")
@@ -394,6 +401,60 @@ def make_dataset(cfg, phase_pairs: str, augment: bool):
 
 # -------------------------------------------------------------------- loss
 
+def flow_query_index(token_weight: torch.Tensor, token_hw) -> torch.Tensor:
+    """(B, M) indices of the supervised tokens plus a one-token ring (the flow is
+    upsampled bilinearly, so pixels near a token's edge also read its neighbours).
+    Padded by repeating the first index; M >= 1."""
+    b = token_weight.shape[0]
+    th, tw = token_hw
+    ring = F.max_pool2d(token_weight.float().view(b, 1, th, tw), 3, 1, 1).flatten(1) > 0
+    count = int(ring.sum(1).max().clamp_min(1))
+    # Stable sort puts the selected tokens first, in raster order.
+    order = torch.sort((~ring).to(torch.uint8), dim=1, stable=True).indices[:, :count]
+    first = order[:, :1].expand(-1, count)
+    keep = torch.arange(count, device=ring.device)[None] < ring.sum(1, keepdim=True)
+    return torch.where(keep, order, first)
+
+
+def scatter_flow(flow: torch.Tensor, queries: torch.Tensor, n_tokens: int) -> torch.Tensor:
+    """(B, M, 3) flow of the query tokens -> (B, N, 3); unqueried tokens get 0
+    (they carry no loss weight and are not bilinear neighbours of any that do)."""
+    out = flow.new_zeros(flow.shape[0], n_tokens, flow.shape[2])
+    return out.scatter(1, queries[..., None].expand(-1, -1, flow.shape[2]), flow)
+
+
+def attention_flow_loss(flows: dict, garment_rgb, target_rgb, clothing_mask, token_weight, token_hw):
+    """Leffa-style attention-flow loss (Zhou et al., CVPR 2025), averaged over blocks.
+
+    Each block's head-averaged person->garment attention gives every person token
+    an expected garment coordinate. Upsampled to a dense flow, it warps the
+    in-shop garment image; L1 against the real person over the clothing pixels
+    of the selected tokens. A diffuse or misplaced attention warps the wrong
+    letters there, so this supervises *where* every clothing token reads, at
+    pixel precision. Training only: inference never warps or pastes.
+    Also returns the head-averaged attention spread (std, pixels / max(H, W)).
+    """
+    b, _, hh, ww = target_rgb.shape
+    side = max(hh, ww)
+    th, tw = token_hw
+    pix_w = F.interpolate(token_weight.float().view(b, 1, th, tw), size=(hh, ww), mode="nearest")
+    pix_w = pix_w * clothing_mask.float()
+    denom = pix_w.sum().clamp_min(1.0) * target_rgb.shape[1]
+    tok_denom = token_weight.float().sum().clamp_min(1.0)
+    l1, spread = [], []
+    for f in flows.values():
+        f = f.float()
+        xy = f[..., :2].transpose(1, 2).reshape(b, 2, th, tw)
+        xy = F.interpolate(xy, size=(hh, ww), mode="bilinear", align_corners=False)
+        # Isotropic pixel / side units -> grid_sample's [-1, 1] (align_corners=False).
+        grid = torch.stack([xy[:, 0] * side / ww * 2 - 1, xy[:, 1] * side / hh * 2 - 1], -1)
+        warped = F.grid_sample(garment_rgb.float(), grid, mode="bilinear", padding_mode="border",
+                               align_corners=False)
+        l1.append(((warped - target_rgb.float()).abs() * pix_w).sum() / denom)
+        spread.append((f[..., 2].clamp_min(1e-8).sqrt() * token_weight.float()).sum() / tok_denom)
+    return torch.stack(l1).mean(), torch.stack(spread).mean()
+
+
 def training_loss(model, teacher, vae, batch, cfg, time_sampler, device, step: int = 0):
     b = batch["image"].shape[0]
     drop = torch.rand(b, device=device) < float(cfg.flow.garment_dropout)
@@ -426,9 +487,16 @@ def training_loss(model, teacher, vae, batch, cfg, time_sampler, device, step: i
                 batch["image"].to(device), batch["garment"].to(device),
                 edit_tok & clothing_tok & ~drop[:, None], garment_valid, grid, grid,
             )
+    acfg = cfg.get("attn_flow")
+    flow_blocks = list(acfg.blocks) if acfg and float(acfg.get("weight", 0.0)) > 0 else []
+    flow_weight = flow_queries = None
+    if flow_blocks:
+        clothing_tok = pool_valid_mask(batch["clothing_mask"].to(device), model.token_hw, threshold=0.25)
+        flow_weight = edit_tok & clothing_tok & ~drop[:, None] & (t >= float(acfg.get("min_t", 0.0)))
+        flow_queries = flow_query_index(flow_weight, model.token_hw)
     out = model(
         xt, t, inputs["cond"], edit_tok, garment_latent=inputs["garment"], garment_mask=inputs["garment_mask"],
-        return_uncertainty=True, return_attention=use_coral,
+        return_uncertainty=True, return_attention=use_coral, flow_blocks=flow_blocks, flow_queries=flow_queries,
     )
     v, logvar = out[0].float(), out[1].float()
 
@@ -454,6 +522,16 @@ def training_loss(model, teacher, vae, batch, cfg, time_sampler, device, step: i
         )
         loss = loss + float(cfg.coral.weight) * corr + float(cfg.coral.entropy_weight) * ent
         metrics.update(loss_coral=corr, loss_coral_entropy=ent, **cm)
+    if flow_blocks:
+        token_weight = flow_weight
+        flows = {k: scatter_flow(f, flow_queries, model.num_tokens) for k, f in out[-1].items()}
+        flow_l1, spread = attention_flow_loss(
+            flows, batch["garment"].to(device), batch["image"].to(device), batch["clothing_mask"].to(device),
+            token_weight, model.token_hw,
+        )
+        loss = loss + float(acfg.weight) * flow_l1 + float(acfg.get("spread_weight", 0.0)) * spread
+        metrics.update(loss_attn_flow=flow_l1, attn_spread_px=spread * max(cfg.model.image_hw),
+                       attn_flow_tokens=token_weight.float().sum(1).mean())
     # Optionally ramp the fine-detail objective with the time curriculum: while
     # pure noise dominates the model is learning to read the garment, and
     # sharpening its endpoint would only sharpen wrong content.
@@ -681,11 +759,15 @@ def main(argv=None):
         ).to(device)
 
     o = cfg.optim
+    fine = [p for n, p in model.new_parameters() if n.split(".")[0] in FINE_PARAMETERS]
     groups = [
-        {"params": [p for _, p in model.new_parameters()], "lr": float(o.lr), "weight_decay": 0.0},
+        {"params": [p for n, p in model.new_parameters() if n.split(".")[0] not in FINE_PARAMETERS],
+         "lr": float(o.lr), "weight_decay": 0.0},
         {"params": [p for _, p in model.pretrained_parameters() if p.requires_grad],
          "lr": float(o.lr) * float(o.pretrained_lr_multiplier), "weight_decay": float(o.weight_decay)},
     ]
+    if fine:  # zero-initialised fine garment path: its own (larger) LR, appended last
+        groups.append({"params": fine, "lr": float(o.get("fine_lr", o.lr)), "weight_decay": 0.0})
     for g in groups:
         g["base_lr"] = g["lr"]
     optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.999), fused=True)

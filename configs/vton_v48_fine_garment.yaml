@@ -1,0 +1,29 @@
+# V48: fine (8 px) garment keys/values in the last person blocks.
+#
+#   bash scripts/run_pfi_v48_fine_garment.sh
+#
+# V47 (detail oversampling, CoRAL 0.3, more decoded loss) did not fix letter
+# identity by update ~1100: graphic-region L1 0.343 -> 0.368, Lee -> "Leo",
+# GAP -> "GAR" at every guidance scale. Each garment token covers a 16x16 px
+# patch at 1024x768, and the CoRAL teacher (DINOv3/16) is no finer, so
+# sub-patch letter strokes cannot be located exactly.
+# From block 21 (after the last CoRAL block, 20) the person stream reads 128x96
+# fine garment tokens (one per latent cell) instead of 64x48 coarse ones. Each
+# fine token = its coarse garment token + zero-initialised 3x3 embedding of its
+# own latent cell + zero-gain sub-patch position offset, projected by the
+# block's pretrained K/V, with a -log 4 attention bias: at initialisation the
+# model is exactly V47 (unit-tested), so no quality is lost at restart.
+# Starts from V47's latest.pt weights (fresh optimizer: new parameters).
+base_config: configs/vton_v47_detail_focus.yaml
+
+weights:
+  init_from: logs/vton-v47-detail-focus/latest.pt
+
+model:
+  fine_garment_from: 21
+
+optim:
+  fine_lr: 1.0e-4                  # zero-initialised fine embedder / gains
+
+train:
+  output_dir: logs/vton-v48-fine-garment

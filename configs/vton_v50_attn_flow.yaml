@@ -1,0 +1,18 @@
+# V50: Leffa-style attention-flow loss on top of V49.
+# V49 probe (step 4000): person->garment attention is diffuse (CoRAL target
+# mass 0.038, ~63% of the mass beyond 2 tokens) and the fine garment path stays
+# unused (output change 0.1%): nothing in the loss rewards reading the right
+# 8 px of the garment. Here every clothing token's head-averaged attention in
+# blocks 20-27 is turned into a garment coordinate, the in-shop image is warped
+# with it and compared (L1) with the real person, plus a small penalty on the
+# attention's spatial spread. Training only; sampling is unchanged.
+base_config: configs/vton_v49_fine_postnorm.yaml
+weights:
+  init_from: logs/vton-v49-fine-postnorm/latest.pt
+attn_flow:
+  weight: 0.25
+  spread_weight: 0.1        # spread in pixels / 1024
+  blocks: [20, 21, 22, 23, 24, 25, 26, 27]
+  min_t: 0.3                # Leffa: skip near-pure-noise tokens
+train:
+  output_dir: logs/vton-v50-attn-flow

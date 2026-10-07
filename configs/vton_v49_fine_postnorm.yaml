@@ -1,0 +1,10 @@
+# V49: V48's fine garment K/V, with the fine residual added after LayerNorm.
+# V48 added it before the norm, against garment hidden states of rms 15-30 in
+# blocks 21-27: it moved the fine keys by under 1% and stayed near zero for 5500
+# steps (graphic L1 0.368 -> 0.353, letters unchanged). Starts from V48's
+# latest.pt; its retired fine weights are dropped and the new path starts at zero.
+base_config: configs/vton_v48_fine_garment.yaml
+weights:
+  init_from: logs/vton-v48-fine-garment/latest.pt
+train:
+  output_dir: logs/vton-v49-fine-postnorm

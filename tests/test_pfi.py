@@ -1,4 +1,6 @@
 """PFI model/sampler invariants on a tiny transformer, no dataset needed."""
+import os
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -6,11 +8,12 @@ import torch
 import torch.nn.functional as F
 
 from vton_ext.coral import CoralTargets, coral_routing_loss
-from vton_ext.pfi_model import VTONInpaintDiT
+from vton_ext.pfi_model import FINE_PARAMETERS, VTONInpaintDiT
 from omegaconf import OmegaConf
 
 from vton_ext.pfi_sample import generate, open_mask, shift_time
-from vton_ext.pfi_train import (EditTimeSampler, decoded_detail_loss, load_cfg, lr_factor,
+from vton_ext.pfi_train import (EditTimeSampler, attention_flow_loss, decoded_detail_loss, flow_query_index,
+                                scatter_flow, load_cfg, lr_factor,
                                 resolve_resume, rollout_endpoint_loss, short_dual_loop_rollout,
                                 validate_config)
 from vton_ext.utils import expand_patch_values
@@ -393,6 +396,167 @@ class PFITests(unittest.TestCase):
         sal = graphic_saliency(rgb, torch.ones(1, 1, 8, 8))
         self.assertGreater(float(sal[..., 2:4, 2:6].min()), 0.99)
         self.assertLess(float(sal[..., 5:, :].max()), 0.02)
+
+    def _fine_pair(self, fine_from=1):
+        base = tiny().eval()
+        fine = VTONInpaintDiT(latent_hw=(8, 6), hidden_size=64, depth=3, num_heads=4, coral_blocks=[0],
+                              coral_heads=2, fine_garment_from=fine_from).eval()
+        base_coral = VTONInpaintDiT(latent_hw=(8, 6), hidden_size=64, depth=3, num_heads=4, coral_blocks=[0],
+                                    coral_heads=2).eval()
+        base_coral.load_state_dict(base.state_dict())
+        missing = fine.load_state_dict(base.state_dict(), strict=False).missing_keys
+        self.assertEqual(sorted(k.split(".")[0] for k in missing),
+                         ["fine_bias"] + ["fine_encoder"] * 6 + ["fine_pos_scale", "fine_scale"])
+        return base_coral, fine
+
+    def test_fine_garment_tokens_start_identical_to_coarse_model(self):
+        base, fine = self._fine_pair()
+        x = inputs()
+        t = torch.rand(2, 12)
+        args = (torch.randn(2, 4, 8, 6), t, x["cond"], x["edit_tokens"])
+        kw = dict(garment_latent=x["garment"], garment_mask=x["garment_mask"], return_uncertainty=True)
+        with torch.no_grad():
+            ref = base(*args, **kw)
+            out = fine(*args, **kw)
+            kv = fine.encode_garment(x["garment"], x["garment_mask"])
+            cached = fine(*args, garment_kv=kv, return_uncertainty=True)
+        for r, o, c in zip(ref, out, cached):
+            torch.testing.assert_close(o, r, atol=1e-5, rtol=1e-5)
+            torch.testing.assert_close(c, o)
+        # Coarse K/V before the fine blocks, 4x garment tokens from them on.
+        self.assertEqual(kv[0][0].shape[2], 12)
+        self.assertEqual(kv[1][0].shape[2], 48)
+        self.assertEqual(kv[2][0].shape[2], 48)
+
+    def test_fine_garment_tokens_learn_and_change_output(self):
+        _, fine = self._fine_pair()
+        fine.train()
+        x = inputs()
+        t = torch.rand(2, 12)
+        v = fine(torch.randn(2, 4, 8, 6), t, x["cond"], x["edit_tokens"],
+                 garment_latent=x["garment"], garment_mask=x["garment_mask"])
+        v.square().mean().backward()
+        self.assertGreater(float(fine.fine_encoder[-1].weight.grad.abs().sum()), 0)
+        self.assertGreater(float(fine.fine_pos_scale.grad.abs().sum()), 0)
+        self.assertGreater(float(fine.fine_bias.grad.abs().sum()), 0)
+        self.assertIn("fine_encoder.2.weight", [n for n, _ in fine.new_parameters()])
+        with torch.no_grad():
+            before = fine(torch.ones(2, 4, 8, 6), t, x["cond"], x["edit_tokens"],
+                          garment_latent=x["garment"], garment_mask=x["garment_mask"])
+            torch.nn.init.normal_(fine.fine_encoder[-1].weight, std=0.1)
+            after = fine(torch.ones(2, 4, 8, 6), t, x["cond"], x["edit_tokens"],
+                         garment_latent=x["garment"], garment_mask=x["garment_mask"])
+        self.assertGreater(float((after - before).abs().max()), 1e-4)
+        with self.assertRaises(ValueError):  # CoRAL must read coarse keys
+            VTONInpaintDiT(latent_hw=(8, 6), hidden_size=64, depth=3, num_heads=4, coral_blocks=[2],
+                           fine_garment_from=1)
+
+    def test_fine_residual_survives_large_garment_hidden_states(self):
+        # V48 regression: a pre-norm residual vanished against rms 15-30 hidden
+        # states. Post-norm, its effect on the fine keys must not shrink with scale.
+        _, fine = self._fine_pair()
+        x = inputs()
+        with torch.no_grad():
+            torch.nn.init.normal_(fine.fine_encoder[-1].weight, std=0.05)
+            changes = []
+            for scale in (1.0, 30.0):
+                fine.garment_embedder.weight.mul_(scale)
+                k_f = fine.encode_garment(x["garment"], x["garment_mask"])[1][0]
+                fine.fine_scale.zero_()
+                k_c = fine.encode_garment(x["garment"], x["garment_mask"])[1][0]
+                fine.fine_scale.fill_(1.0)
+                fine.garment_embedder.weight.div_(scale)
+                changes.append(float((k_f - k_c).norm() / k_c.norm()))
+        self.assertGreater(changes[0], 0.01)
+        self.assertGreater(changes[1], 0.5 * changes[0])
+
+    def test_retired_v48_fine_weights_are_dropped_on_load(self):
+        _, fine = self._fine_pair()
+        state = {k: v for k, v in fine.state_dict().items() if k.split(".")[0] not in FINE_PARAMETERS}
+        state["fine_garment_embedder.weight"] = torch.zeros(64, 5, 3, 3)
+        state["fine_gain"] = torch.ones(2)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "v48.pt")
+            torch.save({"model": state, "step": 7}, path)
+            report = fine.load_weights_any_resolution(path)
+        self.assertEqual(report["source_step"], 7)
+
+    def test_attention_flow_matches_explicit_softmax(self):
+        _, fine = self._fine_pair()
+        for n_keys, grid in ((12, (4, 3)), (48, (8, 6))):
+            q, k = torch.randn(2, 4, 12, 16), torch.randn(2, 4, n_keys, 16)
+            a = ((q @ k.transpose(-2, -1)) / 4.0).softmax(-1).mean(1)  # head-averaged
+            gh, gw = grid
+            ys = (torch.arange(gh) + 0.5) * (8 / gh) / 8
+            xs = (torch.arange(gw) + 0.5) * (6 / gw) / 8
+            y, x = (c.reshape(-1) for c in torch.meshgrid(ys, xs, indexing="ij"))
+            xy = torch.stack([x, y], 1)
+            mean = a @ xy
+            var = a @ xy.square().sum(1) - mean.square().sum(-1)
+            f = fine._attention_flow(q, k)
+            torch.testing.assert_close(f[..., :2], mean, atol=1e-5, rtol=1e-5)
+            torch.testing.assert_close(f[..., 2], var, atol=1e-5, rtol=1e-4)
+
+    def test_forward_flow_blocks_leave_outputs_unchanged(self):
+        _, fine = self._fine_pair()
+        x = inputs()
+        args = (torch.randn(2, 4, 8, 6), torch.rand(2, 12), x["cond"], x["edit_tokens"])
+        kw = dict(garment_latent=x["garment"], garment_mask=x["garment_mask"])
+        with torch.no_grad():
+            ref = fine(*args, **kw)
+            v, flows = fine(*args, **kw, flow_blocks=[0, 2])
+        torch.testing.assert_close(v, ref)
+        self.assertEqual(sorted(flows), [0, 2])
+        self.assertEqual(tuple(flows[2].shape), (2, 12, 3))
+        self.assertTrue(bool((flows[2][..., 2] >= 0).all()))
+
+    def test_flow_queries_match_full_flow_on_supervised_tokens_and_ring(self):
+        _, fine = self._fine_pair()
+        x = inputs()
+        args = (torch.randn(2, 4, 8, 6), torch.rand(2, 12), x["cond"], x["edit_tokens"])
+        kw = dict(garment_latent=x["garment"], garment_mask=x["garment_mask"], flow_blocks=[0, 2])
+        weight = torch.zeros(2, 12, dtype=torch.bool)
+        weight[0, 0] = True          # corner: ring is tokens 0, 1, 3, 4
+        weight[1, 7] = True          # (2, 1): ring is the 3x3 block around it
+        queries = flow_query_index(weight, (4, 3))
+        ring = [{0, 1, 3, 4}, {3, 4, 5, 6, 7, 8, 9, 10, 11}]
+        self.assertEqual(queries.shape[1], 9)
+        for i in range(2):
+            self.assertEqual(set(queries[i].tolist()), ring[i])
+        with torch.no_grad():
+            _, full = fine(*args, **kw)
+            _, part = fine(*args, **kw, flow_queries=queries)
+        for k in (0, 2):
+            sparse = scatter_flow(part[k], queries, 12)
+            for i in range(2):
+                idx = sorted(ring[i])
+                torch.testing.assert_close(sparse[i, idx], full[k][i, idx], atol=1e-5, rtol=1e-5)
+
+    def test_attention_flow_loss_prefers_the_true_correspondence(self):
+        # Person = garment shifted right by one token (16 px); the matching flow
+        # reads 16 px to the left and must beat the identity flow.
+        torch.manual_seed(0)
+        th, tw, hh, ww = 4, 3, 64, 48
+        garment = F.interpolate(torch.rand(1, 3, 8, 6), size=(hh, ww), mode="bilinear", align_corners=False)
+        target = torch.roll(garment, 16, dims=-1)
+        ys = (torch.arange(th) + 0.5) * 16 / hh
+        xs = (torch.arange(tw) + 0.5) * 16 / hh
+        y, x = (c.reshape(-1) for c in torch.meshgrid(ys, xs, indexing="ij"))
+        weight = torch.zeros(1, th * tw, dtype=torch.bool)
+        weight.view(1, th, tw)[:, 1:3, 1:] = True
+        mask = torch.ones(1, 1, hh, ww)
+
+        def loss(dx):
+            f = torch.stack([x - dx, y, torch.full_like(x, 1e-4)], -1)[None].requires_grad_(True)
+            l1, spread = attention_flow_loss({20: f}, garment, target, mask, weight, (th, tw))
+            return l1, spread, f
+
+        right, spread, f = loss(16 / hh)
+        wrong, _, _ = loss(0.0)
+        self.assertLess(float(right), 0.25 * float(wrong))
+        self.assertAlmostEqual(float(spread), 0.01, places=4)
+        (right + spread).backward()
+        self.assertGreater(float(f.grad[0, weight[0]].abs().sum()), 0)
 
     def test_open_mask_per_sample_radius(self):
         m = torch.zeros(2, 1, 21, 21)
