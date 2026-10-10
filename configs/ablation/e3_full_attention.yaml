@@ -1,0 +1,11 @@
+# E3: full attention between the streams: person -> garment as before, and
+# garment -> person (garment queries also attend to the person keys/values of
+# the same block). No new parameters; garment K/V depend on the noisy person
+# state, so they are recomputed at every sampler step (no caching).
+# If batch 4 does not fit, keep the effective batch of 16:
+#   bash scripts/run_ablation.sh e3 train.batch_size=2 train.gradient_accumulation_steps=8
+base_config: configs/ablation/r0_v50_recipe.yaml
+model:
+  attention_mode: full
+train:
+  output_dir: logs/ablation/e3_full_attention

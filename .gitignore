@@ -15,3 +15,7 @@ shardsFaceHQ
 testy.ipynb
 third_party
 .vscode
+
+
+docs/*vton*
+docs/experiment

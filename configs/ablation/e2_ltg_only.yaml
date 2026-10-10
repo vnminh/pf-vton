@@ -1,0 +1,16 @@
+# E2: timesteps from the LTG sampler alone, fixed parameters, no curriculum:
+# no pure-noise / synchronous / detail branches and no schedule over updates.
+# LTG keeps sigma 0.6, scale 1.0 and time shift 2. Its logit-normal location
+# 1.4 is fixed so that the mean editable-token time (0.346) matches R0's mean
+# over its 5000 updates (0.344; R0 moves 0.09 -> 0.50): E2 changes the shape
+# and schedule of the time distribution, not the average noise level.
+base_config: configs/ablation/r0_v50_recipe.yaml
+flow:
+  ltg_loc: 1.4
+  curriculum:
+    start: {pure_noise: 0.0, synchronous: 0.0, detail: 0.0}
+    end: {pure_noise: 0.0, synchronous: 0.0, detail: 0.0}
+    ltg_loc_start: 1.4
+    ltg_loc_end: 1.4
+train:
+  output_dir: logs/ablation/e2_ltg_only

@@ -1,26 +1,26 @@
-# Patch Forcing VTON: V43 at 1024 × 768
+# PFI-VTON: Patch Forcing Inpainting cho thử đồ ảo (VITON-HD 1024 × 768)
 
-For the V46 migration/resume regression, see the
-[27 September audit and recovery instructions](../docs/v46_resume_regression_audit_20260927.md).
-The step-3000 run was resumed with incorrect garment pairs. Restore the historical
-paired split and a clean earlier checkpoint before continuing it.
+Đây là README chính của phần VTON. Mọi lệnh chạy từ **thư mục gốc của repo**.
+Mô hình cuối là **V50** (`configs/vton_v50_attn_flow.yaml`), gồm:
+- DiT PFT-XL/2 hai luồng (person / garment) với attention bất đối xứng;
+- garment K/V mịn (8 px) ở các block cuối;
+- các loss: CoRAL, decoded RGB/high-pass, uncertainty và attention-flow.
 
-Run these commands from the **repository root**. V43 uses the released PFT-XL/2
-weights to initialize a new try-on model. It trains on native-resolution
-VITON-HD images with patch forcing, a DINOv3 correspondence teacher, and a
-curriculum that adds decoded RGB/detail supervision. The configuration is
-[`configs/vton_v43_pfi_1024.yaml`](../configs/vton_v43_pfi_1024.yaml).
+Ablation và đánh giá nằm ở mục 5–6. Các file đánh giá cụ thể ở [`docs/experiment/`](../docs/experiment/README.md).
 
-For the existing V42 model, use the **fine-tuning recipe** below instead of
-starting the VTON conditioning again. The reviewed parent is V42 step 16000;
-its full optimizer checkpoint is preserved separately on the training server.
-See [the high-resolution review](../docs/vton_v43_high_resolution_review.md)
-for the choices and measured memory limits.
+Mã nguồn chính:
 
-## 1. Environment and checkpoints
+| File | Nội dung |
+| --- | --- |
+| [`pfi_model.py`](pfi_model.py) | Mô hình hai luồng, fine garment K/V, attention flow, chế độ `attention_mode` |
+| [`pfi_train.py`](pfi_train.py) | Huấn luyện: bộ lấy mẫu timestep (curriculum, `time_mode`), các loss, eval preview |
+| [`pfi_sample.py`](pfi_sample.py) | Sampler `euler` / `dual_loop` / `look_ahead`, CFG theo trang phục, composite |
+| [`coral.py`](coral.py) | Teacher DINOv3 và CoRAL loss |
+| [`data.py`](data.py), [`pairs.py`](pairs.py) | Dataset VITON-HD, danh sách cặp và fingerprint |
 
-Use Python 3.12 and a CUDA/PyTorch installation appropriate for your GPU. The
-repository's upstream and VTON dependencies are separate:
+## 1. Môi trường và checkpoint tiền huấn luyện
+
+Dùng Python 3.12 và PyTorch phù hợp GPU. Trên máy local có sẵn conda env `vt-env` để chạy test CPU.
 
 ```bash
 python -m pip install -r requirements.txt
@@ -28,192 +28,184 @@ python -m pip install -r requirements-vton.txt
 mkdir -p checkpoints
 ```
 
-V43 needs these three **different** pretrained artifacts:
-
-| Config key | Local path | Source |
+| Khóa config | Đường dẫn | Nguồn |
 | --- | --- | --- |
-| `weights.pft` | `checkpoints/pft-xl_step400k_ema.ckpt` | [Released PFT-XL/2](https://ommer-lab.com/files/pft/pft-xl_step400k_ema.ckpt) |
-| `weights.vae` | `checkpoints/sd_ae.ckpt` | [CompVis first-stage autoencoder](https://github.com/CompVis/fm-boosting#-usage) |
-| `weights.dino` | `checkpoints/dinov3-vits16-pretrain-lvd1689m/` | [Meta DINOv3 ViT-S/16](https://huggingface.co/facebook/dinov3-vits16-pretrain-lvd1689m) |
+| `weights.pft` | `checkpoints/pft-xl_step400k_ema.ckpt` | [PFT-XL/2 công bố](https://ommer-lab.com/files/pft/pft-xl_step400k_ema.ckpt) |
+| `weights.vae` | `checkpoints/sd_ae.ckpt` | [Autoencoder CompVis](https://github.com/CompVis/fm-boosting#-usage) |
+| `weights.dino` | `checkpoints/dinov3-vits16-pretrain-lvd1689m/` | [DINOv3 ViT-S/16 của Meta](https://huggingface.co/facebook/dinov3-vits16-pretrain-lvd1689m) |
 
 ```bash
 curl -fL --retry 3 -o checkpoints/pft-xl_step400k_ema.ckpt \
   'https://ommer-lab.com/files/pft/pft-xl_step400k_ema.ckpt'
 curl -fL --retry 3 -o checkpoints/sd_ae.ckpt \
   'https://www.dropbox.com/scl/fi/lvfvy7qou05kxfbqz5d42/sd_ae.ckpt?rlkey=fvtu2o48namouu9x3w08olv3o&st=vahu44z5&dl=1'
+hf auth login      # DINOv3 là model gated: xin quyền truy cập trước
+hf download facebook/dinov3-vits16-pretrain-lvd1689m --local-dir checkpoints/dinov3-vits16-pretrain-lvd1689m
 ```
 
-Request access to the [gated DINOv3 model](https://huggingface.co/facebook/dinov3-vits16-pretrain-lvd1689m)
-with your Hugging Face account, then authenticate on the training machine and
-download the **whole repository** (the teacher reads both its model and image
-processor configuration):
+- VAE phải là state dict `AutoencoderKL` của `jutils` mà [`vae.py`](vae.py) đọc. Một thư mục VAE của Diffusers không thay thế được.
+- Từ V47 trở đi còn cần `checkpoints/garment_detail_scores.json`, dùng để oversample áo có chữ/logo. Tạo bằng lệnh:
 
 ```bash
-hf auth login
-hf download facebook/dinov3-vits16-pretrain-lvd1689m \
-  --local-dir checkpoints/dinov3-vits16-pretrain-lvd1689m
-test -s checkpoints/pft-xl_step400k_ema.ckpt
-test -s checkpoints/sd_ae.ckpt
-test -s checkpoints/dinov3-vits16-pretrain-lvd1689m/config.json
-test -s checkpoints/dinov3-vits16-pretrain-lvd1689m/preprocessor_config.json
+PYTHONPATH=. python scripts/score_garment_detail.py \
+  --root ../high-resolution-viton-zalando-dataset --output checkpoints/garment_detail_scores.json
 ```
 
-These checkpoint paths are ignored by Git. If you already have the exact files,
-place them at the paths above instead of downloading them again. The SD VAE is
-the `jutils` `AutoencoderKL` state dict expected by [`vae.py`](vae.py); an
-arbitrary Diffusers VAE directory is not interchangeable with `sd_ae.ckpt`.
+Thư mục `checkpoints/` và `logs/` không nằm trong Git, nên phải tự sao lưu.
 
-## 2. VITON-HD data and pair split
+## 2. Dữ liệu VITON-HD và danh sách cặp
 
-Download the [preprocessed 1024 × 768 VITON-HD dataset](https://github.com/shadow2496/VITON-HD#dataset)
-and extract it as a sibling of this repository:
+Tải [VITON-HD 1024 × 768 đã tiền xử lý](https://github.com/shadow2496/VITON-HD#dataset) và giải nén cạnh repo:
 
 ```text
 ../high-resolution-viton-zalando-dataset/
-  train_pairs.txt
   train/{image,cloth,cloth-mask,agnostic-v3.2,agnostic-mask,image-densepose,image-parse-v3}/
-  test/...
+  test/...   test_pairs.txt (unpaired)   test_pairs_paired.txt
 ```
 
-`train_fit_pairs.txt` and `train_dev_pairs.txt` are **local development** lists
-used by V43; they are not supplied by the original dataset. Create a fixed
-256-pair development split from **matching person/cloth identities**, keeping
-the official test split untouched. Some archives' `train_pairs.txt` contains
-**unpaired** combinations. Splitting that file directly trains against an
-unrelated garment and invalidates paired reconstruction metrics.
+**Cảnh báo:** `train_pairs.txt` trong một số bản ZIP gần như toàn cặp *unpaired*. Train trên file đó làm model học tái tạo một áo khác áo điều kiện; xem [biên bản sự cố V46](../docs/v46_resume_regression_audit_20260927.md). Tạo danh sách fit/dev paired, cùng định danh người–áo, giữ nguyên tập test chính thức:
 
 ```bash
-python -m scripts.prepare_pfi_pairs \
-  --root ../high-resolution-viton-zalando-dataset --seed 2026 --method stable-hash --dev-size 256
-python -m scripts.prepare_pfi_pairs \
-  --root ../high-resolution-viton-zalando-dataset --check-only
+python -m scripts.prepare_pfi_pairs --root ../high-resolution-viton-zalando-dataset \
+  --seed 2026 --method stable-hash --dev-size 256
+python -m scripts.prepare_pfi_pairs --root ../high-resolution-viton-zalando-dataset --check-only
 ```
 
-The generator sorts identities before selecting development rows. Its default
-hash method and seed 2026 reproduce the historical split from
-`scripts/make_vton_dev_split.py`, confirmed against the saved V42 preview targets.
-The earlier README's random seed-42 recipe changed both the split and its preview
-identities. Preserve an existing valid split when resuming another experiment;
-use `--method random --seed 42` only if that was the experiment's original recipe.
-It keeps the archive's original lists untouched and refuses to replace a
-different existing split. For an audited repair, `--replace` first backs up
-both existing lists. The dataset loader rejects mismatched person/garment
-identities in paired mode. New training checkpoints store fit/dev fingerprints
-and reject a resume with changed lists or row order; legacy checkpoints cannot
-verify their original split. Keep the exact fit/dev files with your backups.
-If an audit flags a checkpoint with `<checkpoint>.invalid-data.json`, the
-trainer refuses to resume it. Recover a verified clean checkpoint into a new
-run rather than continue the optimizer trained on incorrect garments.
+- **Danh sách đúng:** fit 11.391 dòng (sha256 `2e6e879b…`), dev 256 dòng (`2c5bb414…`).
+- **Danh sách lỗi** của sự cố V46: `fc4f2eab…` / `cf355ce9…`.
+- **Bảo vệ khi resume:** checkpoint lưu fingerprint fit/dev, và trainer từ chối `--resume` nếu danh sách thay đổi.
+- **Bảo vệ khi khởi tạo:** các nhánh ablation bật thêm `weights.init_pairs_must_match`, nên trainer cũng kiểm tra fingerprint khi khởi tạo từ checkpoint.
 
-The loader expects the listed image, mask, DensePose, garment and human-parse
-folders under `train/`. If your dataset lives elsewhere, set `data.root` in
-the config before training. The eight fixed preview indices must be valid in
-`train_dev_pairs.txt` (256 rows satisfy this).
+## 3. Lịch sử huấn luyện của V50
 
-## 3. Train and resume V43
+V50 là kết quả của nhiều chặng nối tiếp, không phải một lần train. Batch hiệu dụng luôn là 16 (4 ảnh × tích lũy 4). Mọi chặng dùng:
+- AdamW (β = 0,9 / 0,999), weight decay 0;
+- clip gradient 1,0; không dùng EMA;
+- warm-up tuyến tính, sau đó cosine giảm còn 10%.
 
-The default config targets full 1024 × 768 images, latent size 128 × 96,
-batch 4 × gradient accumulation 4, and a 30,000-step learning-rate horizon.
-It starts from PFT-XL/2 with a new optimizer (`weights.init_from: null`); it
-does **not** require a V40–V42 checkpoint. Run it on your 48 GB GPU from the
-repository root:
+| Chặng | Độ phân giải | Khởi tạo | Số bước | Thay đổi chính | LR (mới / backbone) |
+| --- | --- | --- | ---: | --- | --- |
+| V40–V42 | 512 × 384 | PFT-XL/2 | 16.000 | Hai luồng, CoRAL; curriculum mở theo `coral_local_mass` ≥ 0,30; decoded RGB/HP từ V42 | 1e-4 / 2e-5, horizon 20k |
+| V43 | 1024 × 768 | V42 bước 16.000 | 1.000 | Chuyển lên 1024 | 1e-5 / 5e-6 |
+| V44 | 1024 × 768 | V43 bước 1.000 | 1.250 | Decoded loss trên toàn ảnh | 1e-5 / 5e-6 |
+| V46 c2f | 1024 × 768 | V44 bước 1.250 | 1.500 | Curriculum thô → mịn theo bước | 4e-5 / 2e-5 |
+| V46 recovery | 1024 × 768 | V46 c2f bước 1.500 | 8.250 | Chạy lại trên danh sách paired sạch | 4e-5 / 2e-5 |
+| V47 | 1024 × 768 | V46 recovery bước 8.250 | 1.000 | Oversample áo có chữ/logo, CoRAL 0,3 | 2e-5 / 1e-5 |
+| V48 | 1024 × 768 | V47 bước 1.000 | 5.500 | Fine garment K/V (residual trước LayerNorm, không học được) | 2e-5 / 1e-5, fine 1e-4 |
+| V49 | 1024 × 768 | V48 bước 5.500 | 4.750 | Fine residual sau LayerNorm | như V48 |
+| V50 | 1024 × 768 | V49 bước 4.750 | xem `checkpoint_step` | Attention-flow loss (Leffa) | như V48 |
+
+Lấy số bước thật của V50 từ `metadata.json` của lần đánh giá (trường `checkpoint_step`). Không đoán con số này.
+
+Tham số chung từ V46 trở đi:
+
+| Nhóm | Giá trị |
+| --- | --- |
+| Time shift | 2 khi train, 1 khi lấy mẫu |
+| LTG | σ = 0,6, scale 1 |
+| Curriculum V46 | Bắt đầu: noise 0,35 / sync 0,25 / detail 0, loc −1. Kết thúc: 0,10 / 0,15 / 0,40, loc 0,8. Ramp tuyến tính 6.000 bước. Phần còn lại là LTG. Từ V47 giữ cố định hỗn hợp cuối |
+| Nhánh detail | t̄ ∈ [0,75; 0,98], độ lệch chuẩn 0,05, không qua time shift |
+| Trọng số loss | flow 1; uncertainty 0,01; CoRAL 0,3 (0,1 trước V47); entropy 0,01; RGB 0,5; HP 2,0 (vùng chữ/logo ×2, chỉ ảnh có t ≥ 0,65, 1 ảnh/microbatch); attention flow 0,25; spread 0,1 |
+| Augment | Người: dịch 3%, scale 0,96–1,04. Áo: dịch 5%, scale 0,94–1,06 |
+| Mặt nạ | Mở rộng 0–24 px khi train, 12 px khi suy luận; vùng mở rộng tô xám |
+| CFG | Garment dropout 0,1 (áo và mặt nạ áo đặt về 0) |
+
+## 4. Train và resume
+
+Mỗi version có một launcher. Launcher tự resume nếu `latest.pt` của run đó đã tồn tại:
 
 ```bash
-PYTHONPATH=. python -m vton_ext.pfi_train \
-  --config configs/vton_v43_pfi_1024.yaml
+bash scripts/run_pfi_v50_attn_flow.sh        # log: logs/vton-v50-attn-flow.log
 ```
 
-Check `logs/vton-v43-pfi-1024/metrics.jsonl` for finite losses and `mem_gb`
-after the first ten steps. `latest.pt` contains model, optimizer and curriculum
-state; every 1,000 steps a model-only `stepXXXXXXX.pt` and an eight-case preview
-are retained. If batch 4 exceeds GPU memory, preserve the effective batch of
-16 with `train.batch_size=1 train.gradient_accumulation_steps=16
-eval.batch_size=1`. If the full-image decoded loss is still too large, add
-`loss.decoded_crop_latent=[64,48] loss.decoded_crop_margin=4`; this supervises
-a clothing-centered window instead of the entire image. These are OmegaConf
-`key=value` overrides appended after the config path.
-
-Resume the **same-resolution V43 run** from its complete checkpoint:
+Hoặc gọi trực tiếp:
 
 ```bash
-test -s logs/vton-v43-pfi-1024/latest.pt
-PYTHONPATH=. python -m vton_ext.pfi_train \
-  --config configs/vton_v43_pfi_1024.yaml --resume auto
+PYTHONPATH=. python -m vton_ext.pfi_train --config configs/vton_v50_attn_flow.yaml --resume auto
 ```
 
-Use the same overrides again if you changed them for the first run. Before
-resuming, verify `logs/vton-v43-pfi-1024/latest.pt` exists; `--resume auto`
-loads that file. To stop after a short pilot without changing the 30,000-step
-learning-rate schedule, add `train.stop_at_step=1000`; then remove this override
-when resuming.
+- **Resume** (`--resume`): cần `latest.pt` đầy đủ, gồm model, optimizer và trạng thái curriculum, cùng kiến trúc và cùng danh sách cặp.
+- **Khởi tạo trọng số** (`weights.init_from`): optimizer mới, và curriculum **bắt đầu lại từ đầu**. Muốn chạy tiếp một run đang dở curriculum thì phải dùng `--resume`.
+- **Chạy thử ngắn:** thêm `train.stop_at_step=N`. Cách này không làm ngắn lịch LR của `train.max_steps`.
+- **Override:** viết `key=value` sau đường dẫn config.
+- **Bộ nhớ:** V50 ở 1024 × 768 dùng khoảng 38–40 GB VRAM và khoảng 21 s/bước trên RTX 4090 48 GB. `latest.pt` nặng khoảng 8 GB, và cần thêm khoảng 8 GB trống trong lúc lưu.
 
-To **initialize weights** from a 512 × 384 PFI checkpoint such as V42 instead,
-copy its model checkpoint to this machine and set `weights.init_from` to that
-path on a *new* V43 run. The position table is rebuilt for 1024 × 768 and the
-optimizer/curriculum start fresh. Do not pass a 512 × 384 checkpoint to
-`--resume`, which requires matching parameter shapes and restores its optimizer:
+## 5. Ablation
+
+Các nhánh ablation **không so với V50**, vì V50 có lịch sử dài và nhiều chặng. Thay vào đó, mọi nhánh khởi tạo từ cùng `logs/v46/step0001500.pt`:
+- đây là V46 paired recovery ở bước 1.500, chỉ chứa trọng số, đã kiểm tra fingerprint sạch;
+- mỗi nhánh chạy 5.000 bước với optimizer mới, cùng seed, cùng thứ tự dữ liệu và cùng lịch LR (warm-up 200, cosine).
+
+Công thức chung của các nhánh:
+- **Công thức V50 đầy đủ:** fine garment K/V từ block 21, attention flow, CoRAL, decoded RGB/HP, uncertainty, oversample chữ/logo.
+- **Curriculum chạy lại từ đầu V46:** ramp nén còn 4.000 bước, rồi giữ hỗn hợp cuối thêm 1.000 bước.
+
+So sánh E1–E4 với R0.
+
+| Nhánh | Config | Thay đổi so với R0 |
+| --- | --- | --- |
+| R0 | `configs/ablation/r0_v50_recipe.yaml` | Không đổi gì (đối chứng) |
+| E1 | `configs/ablation/e1_shared_timestep.yaml` | Mọi patch của một ảnh dùng chung một timestep (`flow.time_mode: shared`): lấy t của một token ngẫu nhiên trong ảnh, nên phân phối biên mỗi token giữ nguyên như R0 |
+| E2 | `configs/ablation/e2_ltg_only.yaml` | Chỉ dùng LTG với tham số cố định (σ 0,6, loc 1,4, scale 1, shift 2), bỏ các nhánh noise/sync/detail và lịch thay đổi. Loc 1,4 làm t trung bình (0,346) khớp R0 tính trên cả quá trình train (0,344) |
+| E3 | `configs/ablation/e3_full_attention.yaml` | Full attention (`model.attention_mode: full`): garment query đọc thêm K/V của person, tức hai chiều person ↔ garment. Không thêm tham số; garment K/V phụ thuộc trạng thái nhiễu nên không cache được khi suy luận |
+| E4 | `configs/ablation/e4_no_decoded_loss.yaml` | Tắt decoded RGB và high-pass loss. Attention-flow loss (cũng tính trên ảnh) vẫn giữ |
 
 ```bash
-PYTHONPATH=. python -m vton_ext.pfi_train \
-  --config configs/vton_v43_pfi_1024.yaml \
-  weights.init_from=checkpoints/v42-stepXXXXXXX.pt \
-  train.output_dir=logs/vton-v43-from-v42-1024
+bash scripts/run_ablation.sh r0 --bench     # 100 bước: chỉ đo tốc độ/bộ nhớ, thư mục output riêng
+bash scripts/run_ablation.sh e3 --bench     # E3 chậm hơn; kiểm tra batch 4 có vừa không
+bash scripts/run_ablation.sh r0             # train; tự resume logs/ablation/r0_v50_recipe/latest.pt
+bash scripts/run_ablation.sh e3 train.batch_size=2 train.gradient_accumulation_steps=8   # vẫn batch hiệu dụng 16
 ```
 
-The transfer checkpoint is optional and is **not** hosted with the three
-pretrained artifacts above. `--resume` should only be used for a V43
-`latest.pt` from the same architecture and resolution. Logs and checkpoints
-stay under `logs/`, which is ignored by Git; back up wanted checkpoints
-separately from the source repository.
+- **Chuẩn bị:** máy train cần `logs/v46/step0001500.pt`, các checkpoint ở mục 1, và danh sách fit/dev paired sạch ở mục 2.
+- **Chạy tuần tự:** mỗi lần chạy một nhánh, vì đĩa thường không đủ cho nhiều `latest.pt` cùng lúc.
+- **Benchmark:** chỉ để chọn ngân sách, không dùng để xếp hạng chất lượng.
 
-## 4. Recommended continuation from V42
+Những gì **không** ablate, và lý do:
+- **Uncertainty loss:** sampler look-ahead cần log-variance dự đoán để chọn token khó, nên tắt loss này thì sampler mất ý nghĩa.
+- **σ của LTG ≥ 0,5:** không có tác dụng. Độ lệch chuẩn thực tế là `min(t̄/2, σ)` và t̄ < 1, nên σ = 0,6 và σ = 0,9 sinh ra đúng cùng các timestep.
 
-On the current server, `checkpoints/pfi-safety/v42-step16000.pt` holds the
-weights extracted from the last saved V42 checkpoint. Copy this file when
-moving machines; it is not included in Git or the public downloads.
+## 6. Đánh giá
 
-For a GPU with enough memory for full-image decoded supervision:
+[`docs/experiment/infer_modal.py`](../docs/experiment/infer_modal.py) chạy trên Modal (H100, volume `VTON-HD`). Mỗi job đánh giá một checkpoint với một cấu hình sampler, trên toàn bộ 2.032 cặp paired và unpaired của tập test. Script báo cáo:
+- MSE, SSIM, LPIPS (AlexNet);
+- FID và KID (torch-fidelity, cùng đặc trưng Inception; KID 100 tập con × 1.000 ảnh);
+- thời gian lấy mẫu (giây/ảnh, đã đồng bộ GPU);
+- số lượt gọi model và denoiser mỗi ảnh (CFG làm số lượt gọi denoiser tăng gấp đôi).
+
+Mỗi cấu hình cần một `--output-tag` riêng.
 
 ```bash
-PYTHONPATH=. python -m vton_ext.pfi_train \
-  --config configs/vton_v43_pfi_1024_finetune.yaml
+# V50: độ lệch theo seed lấy mẫu (3 seed), CFG 1,5, look-ahead 50 NFE
+for s in 42 123 2026; do modal run docs/experiment/infer_modal.py --nfe 50 --cfg-scales 1.5 --seed $s \
+    --output-tag v50-la50-cfg1.5-seed$s; done
+# V50: timestep riêng theo token (look-ahead) so với một timestep chung (Euler)
+modal run docs/experiment/infer_modal.py --sampler euler --nfe 50 --cfg-scales 1.5 --output-tag v50-euler50-cfg1.5-seed42
+# V50: tham số look-ahead (p = phân vị độ bất định; context ratio = khoảng nhìn trước)
+modal run docs/experiment/infer_modal.py --nfe 50 --cfg-scales 1.5 --p 0.5 --output-tag v50-la50-p05-cfg1.5-seed42
+modal run docs/experiment/infer_modal.py --nfe 50 --cfg-scales 1.5 --context-ratio 2.0 --output-tag v50-la50-r20-cfg1.5-seed42
+# Một nhánh ablation (E1 chạy thêm --sampler euler)
+modal run docs/experiment/infer_modal.py --checkpoint /data/logs/ablation/e1_shared_timestep/latest.pt \
+    --config-path configs/ablation/e1_shared_timestep.yaml --nfe 50 --cfg-scales 1.5 --output-tag e1-la50-cfg1.5-seed42
+# Gộp mean ± std theo seed, sau khi tải các file JSON về
+modal volume get VTON-HD experiments ./experiments
+python3 scripts/aggregate_pfi_eval.py --root ./experiments
 ```
 
-For the current 24 GB RTX 3090:
+Lưu ý khi diễn giải kết quả:
+- **Hai loại độ lệch chuẩn:** std theo seed lấy mẫu khác với std theo tập con của KID; không trộn hai loại.
+- **Một seed train mỗi nhánh:** chênh lệch nhỏ hơn độ lệch theo seed lấy mẫu thì chưa đủ để kết luận.
+- **Xem ảnh crop:** luôn xem crop vùng áo và logo bên cạnh các con số, vì FID/KID không cho biết chữ có đúng hay không.
+
+## 7. Kiểm thử
 
 ```bash
-PYTHONPATH=. python -m vton_ext.pfi_train \
-  --config configs/vton_v43_pfi_1024_24gb.yaml
+PYTHONPATH=. /home/minh-le-vo-nhat/anaconda3/envs/vt-env/bin/python tests/test_pfi.py   # 42 test, CPU
 ```
 
-Both recipes use 1024 × 768 inputs and the full 3,072-token person and garment
-streams. The 24 GB variant uses smaller microbatches and a jittered 512 × 384
-clothing crop for decoded loss, with 32 pixels of decoder context around it.
-It evaluates whole images and accumulates an effective batch of 16. Cropped
-decoder supervision is an approximation because decoder context is limited;
-it is not identical to full-image decoded loss.
-
-The fine-tuning pilot runs 1,000 **new** optimizer steps with a 10,000-step LR
-horizon, 100 warmup steps, and a backbone peak LR of `5e-6`. It retains the
-learned time-mixture probabilities and uses a new optimizer. Step 0, 500 and
-1000 previews compare Euler 8, shifted dual-loop 8, and unshifted dual-loop 8.
-Each uses eight person-denoiser calls (`cfg=1`). Evaluation noise is fixed per
-case and does not change with evaluation batch size.
-
-The server launcher [`run_pfi_v43_finetune.sh`](../scripts/run_pfi_v43_finetune.sh)
-resumes the 24 GB run automatically if its `latest.pt` exists. Inspect it with
-`supervisorctl status pfi-v43-1024` and
-`tail -f logs/vton-v43-pfi-1024-24gb.log`. To continue past the pilot, increase
-`train.stop_at_step` without shortening `train.max_steps`.
-
-Before changing microbatch size or enabling full-image decoded loss, run the
-memory probe; it forces the decoded objective on and tests backward,
-accumulated gradients, and resident Adam state across two updates:
-
-```bash
-PYTHONPATH=. python scripts/check_pfi_high_resolution.py \
-  --config configs/vton_v43_pfi_1024_24gb.yaml \
-  --output logs/v43-memory-probe.json
-```
-
-It uses an optimizer learning rate of zero and saves no model checkpoint.
+Bộ test kiểm tra:
+- mô hình ban đầu tương đương mô hình cha khi thêm nhánh mới;
+- attention flow;
+- timestep chung giữ đúng phân phối biên;
+- trong full attention, garment đọc được trạng thái person và sampler vẫn chạy kèm CFG;
+- cùng các bất biến khác của sampler và loss.

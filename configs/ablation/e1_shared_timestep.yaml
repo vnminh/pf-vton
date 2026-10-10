@@ -1,0 +1,10 @@
+# E1: one timestep for every patch of an example (no per-patch times).
+# Each example takes the time of one of its own tokens drawn at random, so the
+# per-token marginal distribution equals R0's; only the per-patch spread inside
+# an image is removed. Evaluate with Euler (shared t, matches training) and with
+# look-ahead (per-token t at inference).
+base_config: configs/ablation/r0_v50_recipe.yaml
+flow:
+  time_mode: shared
+train:
+  output_dir: logs/ablation/e1_shared_timestep

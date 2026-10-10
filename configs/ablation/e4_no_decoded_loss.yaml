@@ -1,0 +1,8 @@
+# E4: decoded image-space RGB and high-pass losses off. The attention-flow loss
+# (also computed on images) stays on, so this is not "no image-space loss".
+base_config: configs/ablation/r0_v50_recipe.yaml
+loss:
+  decoded_rgb_weight: 0.0
+  decoded_highpass_weight: 0.0
+train:
+  output_dir: logs/ablation/e4_no_decoded_loss

@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from vton_ext.coral import CoralTargets, coral_routing_loss
-from vton_ext.pfi_model import FINE_PARAMETERS, VTONInpaintDiT
+from vton_ext.pfi_model import FINE_PARAMETERS, GarmentInputs, VTONInpaintDiT
 from omegaconf import OmegaConf
 
 from vton_ext.pfi_sample import generate, open_mask, shift_time
@@ -557,6 +557,82 @@ class PFITests(unittest.TestCase):
         self.assertAlmostEqual(float(spread), 0.01, places=4)
         (right + spread).backward()
         self.assertGreater(float(f.grad[0, weight[0]].abs().sum()), 0)
+
+    def test_shared_time_mode_keeps_marginal_but_one_time_per_example(self):
+        def sampler(mode):
+            return EditTimeSampler(OmegaConf.create({"flow": {
+                "ltg_std": 0.6, "ltg_loc": 0.0, "ltg_scale": 1.0, "time_shift": 2.0, "time_mode": mode,
+                "curriculum": {"start": {"pure_noise": 0.1, "synchronous": 0.15, "detail": 0.4},
+                               "end": {"pure_noise": 0.1, "synchronous": 0.15, "detail": 0.4},
+                               "detail_range": [0.75, 0.98], "detail_std": 0.05, "detail_unshifted": True,
+                               "gate_metric": "m", "gate_threshold": 2.0, "gate_min_steps": 0,
+                               "gate_max_steps": 0, "ramp_steps": 1}}}))
+        torch.manual_seed(0)
+        per_patch = sampler("per_patch")(8192, 16, "cpu")
+        torch.manual_seed(0)
+        shared = sampler("shared")(8192, 16, "cpu")
+        self.assertTrue(bool((shared == shared[:, :1]).all()))
+        self.assertGreater(float(per_patch.std(1).mean()), 0.02)
+        # Same per-token marginal: quantiles agree.
+        q = torch.tensor([0.1, 0.25, 0.5, 0.75, 0.9])
+        torch.testing.assert_close(shared.flatten().quantile(q), per_patch.flatten().quantile(q), atol=0.02, rtol=0)
+        with self.assertRaises(ValueError):
+            sampler("none")
+
+    def _full_pair(self):
+        kw = dict(latent_hw=(8, 6), hidden_size=64, depth=3, num_heads=4, coral_blocks=[0], coral_heads=2,
+                  fine_garment_from=1)
+        torch.manual_seed(0)
+        asym = VTONInpaintDiT(**kw).eval()
+        for p_ in asym.parameters():
+            torch.nn.init.normal_(p_, std=0.05)
+        full = VTONInpaintDiT(**kw, attention_mode="full").eval()
+        full.load_state_dict(asym.state_dict())
+        return asym, full
+
+    def test_full_attention_lets_garment_read_person(self):
+        asym, full = self._full_pair()
+        x = inputs()
+        t = torch.rand(2, 12)
+        kw = dict(garment_latent=x["garment"], garment_mask=x["garment_mask"], return_uncertainty=True,
+                  return_attention=True, flow_blocks=[0, 2])
+        z = torch.randn(2, 4, 8, 6)
+        with torch.no_grad():
+            v_a, _, _, _ = asym(z, t, x["cond"], x["edit_tokens"], **kw)
+            v_f, lv, att, flows = full(z, t, x["cond"], x["edit_tokens"], **kw)
+            packed = full.encode_garment(x["garment"], x["garment_mask"])
+            v_c, _ = full(z, t, x["cond"], x["edit_tokens"], garment_kv=packed, return_uncertainty=True)
+        self.assertIsInstance(packed, GarmentInputs)
+        torch.testing.assert_close(v_c, v_f)                 # sampler path == training path
+        self.assertGreater(float((v_f - v_a).abs().max()), 1e-4)
+        self.assertEqual(tuple(att[0].shape), (2, 2, 12, 12))
+        self.assertEqual(tuple(flows[2].shape), (2, 12, 3))   # fine keys from block 1 on
+        with self.assertRaises(ValueError):                  # cached asymmetric K/V are invalid here
+            full(z, t, x["cond"], x["edit_tokens"], garment_kv=asym.encode_garment(x["garment"], x["garment_mask"]))
+
+        # Garment features now depend on the person state: the person input
+        # reaches the garment tokens' keys (asymmetric: they never see it).
+        full.train()
+        z_req = z.clone().requires_grad_(True)
+        captured = {}
+        orig = full._garment_block
+        def spy(i, xg, *a, **k):
+            out = orig(i, xg, *a, **k)
+            captured.setdefault(i, out[1])
+            return out
+        full._garment_block = spy
+        full(z_req, t, x["cond"], x["edit_tokens"], garment_latent=x["garment"], garment_mask=x["garment_mask"])
+        full._garment_block = orig
+        captured[2].square().sum().backward()
+        self.assertGreater(float(z_req.grad.abs().sum()), 0)
+
+    def test_full_attention_generates_with_guidance(self):
+        _, full = self._full_pair()
+        x = inputs()
+        torch.manual_seed(0)
+        out = generate(full, x, nfe=4, sampler="look_ahead", cfg_scale=2.0)
+        self.assertEqual(tuple(out.shape), (2, 4, 8, 6))
+        self.assertTrue(bool(torch.isfinite(out).all()))
 
     def test_open_mask_per_sample_radius(self):
         m = torch.zeros(2, 1, 21, 21)

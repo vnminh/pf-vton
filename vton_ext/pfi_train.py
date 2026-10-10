@@ -57,6 +57,7 @@ def build_model(cfg, load_pretrained: bool = True) -> VTONInpaintDiT:
         pos_embed=str(m.get("pos_embed", "interpolate")),
         pos_embed_trainable=bool(m.get("pos_embed_trainable", False)),
         fine_garment_from=m.get("fine_garment_from"),
+        attention_mode=str(m.get("attention_mode", "asymmetric")),
     )
     model.time_shift = float(cfg.flow.get("time_shift", 1.0))
     if load_pretrained:
@@ -127,6 +128,10 @@ class EditTimeSampler:
                      for this branch alone (omitting it preserves legacy LTG);
       * otherwise    LTG below a logit-normal maximum (patch forcing).
 
+    ``flow.time_mode: shared`` (ablation) then gives every token of an example
+    the time of one of its tokens drawn uniformly at random: the per-token
+    marginal distribution is unchanged, but all patches share one timestep.
+
     Mixture weights start at ``start`` and move to ``end`` over ``ramp_steps``
     once the garment condition is good enough: an EMA of ``gate_metric``
     reaches ``gate_threshold`` after ``gate_min_steps``, or ``gate_max_steps``
@@ -167,6 +172,9 @@ class EditTimeSampler:
         loc = f.ltg_loc
         self.loc_start = float(c.get("ltg_loc_start", loc))
         self.loc_end = float(c.get("ltg_loc_end", loc))
+        self.time_mode = str(f.get("time_mode", "per_patch"))
+        if self.time_mode not in ("per_patch", "shared"):
+            raise ValueError("flow.time_mode must be 'per_patch' or 'shared'")
         self.metric_ema = None
         self.ramp_start = None
 
@@ -225,7 +233,11 @@ class EditTimeSampler:
         t = torch.where(sync[:, None], t_bar[:, None].expand(-1, n), t)
         t = torch.where(noise[:, None], torch.zeros_like(t), t)
         shifted = shift_time(t, self.time_shift)
-        return torch.where(detail[:, None], t, shifted) if self.detail_unshifted else shifted
+        t = torch.where(detail[:, None], t, shifted) if self.detail_unshifted else shifted
+        if self.time_mode == "shared":
+            pick = torch.randint(n, (b, 1), device=device)
+            t = t.gather(1, pick).expand(-1, n).contiguous()
+        return t
 
 
 # ------------------------------------------------------------------- utils
@@ -728,6 +740,14 @@ def main(argv=None):
     data_pairs = split_manifest(train_ds.pair_path, dev_base.pair_path)
     if any(not 0 <= int(i) < len(dev_base) for i in cfg.eval.indices):
         raise ValueError("eval.indices must be valid indices in the development split")
+    init_from = cfg.weights.get("init_from")
+    if init_from and not resume and bool(cfg.weights.get("init_pairs_must_match", False)):
+        # Ablations branch from one checkpoint: refuse a different (e.g. unpaired) split.
+        init_pairs = torch.load(init_from, map_location="cpu", weights_only=False).get("data_pairs")
+        if not validate_resume_pairs(init_pairs, data_pairs):
+            raise ValueError(f"{init_from} has no pair fingerprints; cannot certify its training split")
+        print(f"init checkpoint pair fingerprints match: fit {data_pairs['fit']['sha256'][:12]}, "
+              f"dev {data_pairs['dev']['sha256'][:12]}", flush=True)
     ckpt = torch.load(resume, map_location="cpu", weights_only=False) if resume else None
     if ckpt is not None:
         if "optimizer" not in ckpt:

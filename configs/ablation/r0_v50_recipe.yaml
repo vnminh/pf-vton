@@ -1,0 +1,44 @@
+# Ablation control R0: the full V50 recipe (fine garment K/V, attention-flow
+# loss, CoRAL + entropy, decoded RGB/HP, uncertainty, detail oversampling),
+# branched from the clean paired V46 recovery checkpoint at update 1500.
+#
+#   bash scripts/run_ablation.sh r0
+#
+# Every ablation (E1-E4) inherits this file and changes exactly one thing, so
+# all branches share the init weights, fresh optimizer, seed, data order,
+# curriculum, LR horizon and number of updates. V50 itself (a longer multi-stage
+# history) is the final model, not the ablation reference: compare E1-E4 to R0.
+base_config: configs/vton_v50_attn_flow.yaml
+
+weights:
+  init_from: logs/v46/step0001500.pt     # V46 paired recovery, update 1500 (weights only)
+  init_pairs_must_match: true            # fit 2e6e879b..., dev 2c5bb414...: never the unpaired split
+
+flow:
+  curriculum:
+    # Restarted from V46's beginning in every branch, compressed to fit the
+    # 5000-update horizon: coarse (t near 0) -> fine over 4000 updates, then
+    # 1000 updates at V46's final mixture.
+    start: {pure_noise: 0.35, synchronous: 0.25, detail: 0.00}
+    end: {pure_noise: 0.10, synchronous: 0.15, detail: 0.40}
+    ltg_loc_start: -1.0
+    ltg_loc_end: 0.8
+    ramp_steps: 4000
+
+optim:
+  lr: 2.0e-5                 # new embedders; backbone x0.5
+  pretrained_lr_multiplier: 0.5
+  fine_lr: 1.0e-4            # zero-initialised fine garment path
+  warmup_steps: 200
+
+train:
+  max_steps: 5000            # cosine LR horizon = number of updates
+  output_dir: logs/ablation/r0_v50_recipe
+  save_every: 250            # resumable latest.pt
+  keep_every: 1000           # bf16 weight snapshots for later evaluation
+  keep_last: 5
+  min_free_gb: 12
+
+eval:
+  at_start: true
+  every: 1000                # 8 fixed dev previews only; test metrics come from infer_modal.py

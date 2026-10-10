@@ -34,12 +34,18 @@ One pretrained PFT-XL/2 transformer, no warper, no transport, no pixel paste:
   person token, averaged over heads. It is computed as a second attention
   with the key coordinates as values, so the (queries x keys) map is never
   stored. Training warps the garment image with it (Leffa, CVPR 2025).
+* Attention mode (ablation, ``attention_mode``): "asymmetric" (default) is the
+  one-way garment -> person flow above. "full" also lets every garment query
+  attend to the person keys/values of the same block (person -> garment), so
+  garment features depend on the noisy person state: no new parameters, but
+  garment K/V can no longer be cached, and ``encode_garment`` only packs the
+  garment inputs (``GarmentInputs``) for ``forward`` to run jointly.
 """
 from __future__ import annotations
 
 import math
 
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -53,6 +59,14 @@ from vton_ext.utils import extract_state_dict, rectangular_pos_from_square, sinc
 ROLE_EDIT, ROLE_KNOWN, ROLE_GARMENT = 0, 1, 2
 
 GarmentKV = List[Tuple[torch.Tensor, torch.Tensor]]
+ATTENTION_MODES = ("asymmetric", "full")
+
+
+class GarmentInputs(NamedTuple):
+    """What ``encode_garment`` returns in "full" attention mode: garment K/V
+    depend on the person state there, so they are computed inside ``forward``."""
+    latent: torch.Tensor
+    mask: torch.Tensor
 
 FINE_PARAMETERS = {"fine_encoder", "fine_scale", "fine_pos_scale", "fine_bias"}
 # V48's pre-norm fine path; dropped when loading its checkpoints.
@@ -77,6 +91,7 @@ class VTONInpaintDiT(PatchForcingDiT):
         pos_embed_trainable: bool = False,
         fine_garment_from: Optional[int] = None,
         fine_channels: int = 256,
+        attention_mode: str = "asymmetric",
     ):
         super().__init__(
             input_size=32,
@@ -103,6 +118,9 @@ class VTONInpaintDiT(PatchForcingDiT):
         if pos_embed not in ("interpolate", "sincos"):
             raise ValueError("pos_embed must be 'interpolate' or 'sincos'")
         self.pos_embed_mode = pos_embed
+        if attention_mode not in ATTENTION_MODES:
+            raise ValueError(f"attention_mode must be one of {ATTENTION_MODES}")
+        self.attention_mode = attention_mode
         self.gradient_checkpointing = False
 
         # Rectangular positions (initialised from the square pretrained table in
@@ -263,7 +281,9 @@ class VTONInpaintDiT(PatchForcingDiT):
         delta = fine - self._up2(self.pos_embed.float())
         return (delta / delta.pow(2).mean().sqrt().clamp_min(1e-6)).to(self.pos_embed.dtype)
 
-    def _garment_block(self, idx: int, x: torch.Tensor, c: torch.Tensor, fine_r=None, fine_pos=None):
+    def _garment_block(self, idx: int, x: torch.Tensor, c: torch.Tensor, fine_r=None, fine_pos=None,
+                       person_kv=None):
+        """``person_kv`` ("full" mode): garment queries also attend to these person keys/values."""
         blk = self.blocks[idx]
         sm, scm, gm, sp, scp, gp = blk.adaLN_modulation(c).chunk(6, dim=-1)
         q, k, v = self._qkv(blk.attn, pf_modulate(blk.norm1(x), sm, scm))
@@ -274,6 +294,8 @@ class VTONInpaintDiT(PatchForcingDiT):
             hf = pf_modulate(blk.norm1(self._up2(x)), sm[:, :1], scm[:, :1])
             hf = hf + self.fine_scale[j] * fine_r + self.fine_pos_scale[j] * fine_pos
             _, exposed_k, exposed_v = self._qkv(blk.attn, hf)
+        if person_kv is not None:
+            k, v = torch.cat([k, person_kv[0]], 2), torch.cat([v, person_kv[1]], 2)
         x = x + gm * self._out(blk.attn, F.scaled_dot_product_attention(q, k, v))
         x = x + gp * blk.mlp(pf_modulate(blk.norm2(x), sp, scp))
         return x, exposed_k, exposed_v
@@ -309,11 +331,16 @@ class VTONInpaintDiT(PatchForcingDiT):
         var = (m[..., 2:].sum(-1) - mean.square().sum(-1)).clamp_min(0)
         return torch.cat([mean, var[..., None]], -1)
 
+    def _person_qkv(self, idx: int, x, c):
+        blk = self.blocks[idx]
+        sm, scm = blk.adaLN_modulation(c).chunk(6, dim=-1)[:2]
+        return self._qkv(blk.attn, pf_modulate(blk.norm1(x), sm, scm))
+
     def _person_block(self, idx: int, x, c, kg, vg, want_attn: bool, bias=None, want_flow: bool = False,
-                      flow_queries=None):
+                      flow_queries=None, qkv=None):
         blk = self.blocks[idx]
         sm, scm, gm, sp, scp, gp = blk.adaLN_modulation(c).chunk(6, dim=-1)
-        q, k, v = self._qkv(blk.attn, pf_modulate(blk.norm1(x), sm, scm))
+        q, k, v = qkv if qkv is not None else self._qkv(blk.attn, pf_modulate(blk.norm1(x), sm, scm))
         mask = None
         if bias is not None:
             # Person keys unbiased; per-head bias on the fine garment keys
@@ -332,6 +359,15 @@ class VTONInpaintDiT(PatchForcingDiT):
         logits = torch.matmul(q[:, :h].float(), kg[:, :h].float().transpose(-2, -1)) * (q.shape[-1] ** -0.5)
         return x, logits.softmax(dim=-1), flow
 
+    def _joint_block(self, idx: int, h, c, xg, cg, fine_r, fine_pos, bias, want_attn: bool, want_flow: bool,
+                     flow_queries):
+        """"full" mode: one block of both streams, each attending to the other.
+        Garment K/V are taken before the garment update, as in asymmetric mode."""
+        q, k, v = self._person_qkv(idx, h, c)
+        xg, kg, vg = self._garment_block(idx, xg, cg, fine_r, fine_pos, person_kv=(k, v))
+        h, a, f = self._person_block(idx, h, c, kg, vg, want_attn, bias, want_flow, flow_queries, qkv=(q, k, v))
+        return h, xg, a, f
+
     def _run(self, fn, *args):
         if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
             return checkpoint(fn, *args, use_reentrant=False)
@@ -339,8 +375,8 @@ class VTONInpaintDiT(PatchForcingDiT):
 
     # ---------------------------------------------------------------- forward
 
-    def encode_garment(self, garment_latent: torch.Tensor, garment_mask: torch.Tensor) -> GarmentKV:
-        """Per-block garment K/V. Independent of the noisy person state."""
+    def _garment_start(self, garment_latent: torch.Tensor, garment_mask: torch.Tensor):
+        """Garment tokens, conditioning and fine-path inputs before block 0."""
         b = garment_latent.shape[0]
         x = self._patch(self.garment_embedder, torch.cat([garment_latent, garment_mask], 1))
         x = x + self.pos_embed + self.role_token[ROLE_GARMENT]
@@ -350,6 +386,15 @@ class VTONInpaintDiT(PatchForcingDiT):
         if self.fine_garment_from is not None:
             fine_r = self.fine_encoder(torch.cat([garment_latent, garment_mask], 1)).flatten(2).transpose(1, 2)
             fine_pos = self._fine_position_delta().to(x.dtype)
+        return x, c, fine_r, fine_pos
+
+    def encode_garment(self, garment_latent: torch.Tensor,
+                       garment_mask: torch.Tensor) -> Union[GarmentKV, GarmentInputs]:
+        """Per-block garment K/V. Independent of the noisy person state
+        (asymmetric mode); "full" mode only packs the inputs for ``forward``."""
+        if self.attention_mode == "full":
+            return GarmentInputs(garment_latent, garment_mask)
+        x, c, fine_r, fine_pos = self._garment_start(garment_latent, garment_mask)
         kv: GarmentKV = []
         for idx in range(len(self.blocks)):
             if fine_r is not None and idx >= self.fine_garment_from:
@@ -383,6 +428,8 @@ class VTONInpaintDiT(PatchForcingDiT):
         """
         if garment_kv is None:
             garment_kv = self.encode_garment(garment_latent, garment_mask)
+        if self.attention_mode == "full" and not isinstance(garment_kv, GarmentInputs):
+            raise ValueError("full attention needs the garment inputs, not cached K/V")
         b = x.shape[0]
         role = torch.where(edit_tokens, ROLE_EDIT, ROLE_KNOWN)
         h = self.x_embedder.proj(x).flatten(2).transpose(1, 2) + self._patch(self.cond_embedder, cond)
@@ -392,9 +439,24 @@ class VTONInpaintDiT(PatchForcingDiT):
         attention: Dict[int, torch.Tensor] = {}
         flows: Dict[int, torch.Tensor] = {}
         flow_blocks = set(int(i) for i in flow_blocks)
+        if self.attention_mode == "full":
+            xg, cg, fine_r, fine_pos = self._garment_start(garment_kv.latent, garment_kv.mask)
         for idx in range(len(self.blocks)):
             want = return_attention and idx in self.coral_blocks
             wf = idx in flow_blocks
+            if self.attention_mode == "full":
+                fine = self.fine_garment_from is not None and idx >= self.fine_garment_from
+                h, xg, a, f = self._run(
+                    lambda h_, c_, x_, g_, r_, p_, b_, i=idx, w=want, wf=wf:
+                        self._joint_block(i, h_, c_, x_, g_, r_, p_, b_, w, wf, flow_queries),
+                    h, c, xg, cg, fine_r if fine else None, fine_pos if fine else None,
+                    self.fine_bias[idx - self.fine_garment_from] if fine else None,
+                )
+                if a is not None:
+                    attention[idx] = a
+                if f is not None:
+                    flows[idx] = f
+                continue
             kg, vg = garment_kv[idx]
             if self.fine_garment_from is not None and idx >= self.fine_garment_from:
                 h, a, f = self._run(
