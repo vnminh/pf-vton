@@ -229,12 +229,16 @@ Patch Forcing(PF) \cite{pf} đã chỉ ra rằng việc gán timestep độc l�
 Dựa trên cơ chế này, PFI-VTON thiết kế lại phân phối timestep cho bài toán thử đồ ảo để phù hợp với điều kiện trang phục. Khác với bài toán sinh ảnh tổng quát, vùng EDIT trên đầu vào phải đồng thời học hai nhiệm vụ: hình thành nên được hình dáng trang phục khớp với dáng người từ điều kiện ngoài ảnh và tái tạo lại được các chi tiết đặc trưng của trang phục (nhưng logo, họa tiết, ...). Vì vậy, chúng tôi đề xuất sử dụng một phân phối hỗn hợp
 \begin{equation}
 q_s=\pi_0(s)q_{\mathrm{noise}}+\pi_S(s)q_{\mathrm{sync}}+\pi_D(s)q_{\mathrm{detail}}+\pi_L(s)q_{\mathrm{LTG}},\qquad \pi_0(s)+\pi_S(s)+\pi_D(s)+\pi_L(s)=1.
+\label{eq:time_mixture}
 \end{equation}
 
 Trong đó, \(q_{\mathrm{LTG}}\) kế thừa timestep sampler của Patch Forcing để tạo sự không đồng bộ có kiểm soát giữa các patch:
 \begin{equation}
 \eta_i\sim\mathcal N(0,1),\qquad \widetilde t_i=\bar t-|\eta_i|\min\left(\frac{\bar t}{2},\sigma\right),\qquad \widetilde t_i\leq\bar t.
+\label{eq:ltg}
 \end{equation}
+
+Ở nhánh LTG, \(\bar t=\operatorname{sigmoid}(\mu+\epsilon)\) với \(\epsilon\sim\mathcal N(0,1)\); nếu \(\widetilde t_i<0\), mã nguồn thay bằng một mẫu đều trên \([0,\bar t]\). Sau đó áp dụng dịch thời gian \(t_i=\widetilde t_i/[\widetilde t_i+a(1-\widetilde t_i)]\). Nhánh \textit{detail} lấy \(\bar t\sim U(0.75,0.98)\), giới hạn độ lệch ở \(\sigma_D=0.05\) và không dịch thời gian. Đây là các quy tắc lấy mẫu cụ thể, không phải bốn bộ lấy mẫu suy luận khác nhau.
 
 Dựa trên nền tảng đó, PFI-VTON thêm vào các trạng thái timestep để phù hợp với điều kiện đặc thù của bài toán VTON. Thành phần \textit{noise} gán toàn bộ patch EDIT tại \(t_i=0\), loại bỏ thông tin target khỏi vùng cần sinh và buộc mô hình khai thác đặc trưng ảnh trang phục tham chiếu, DensePose và vùng người đã quan sát. Thành phần \textit{synchronous} gán toàn bộ patch với cùng mức độ nhiễu, trong khi thành phần \textit{detail} tăng mật độ các mẫu gần \(t=1\) để tập trung học các cấu trúc cục bộ và chi tiết tần số cao của trang phục. Trọng số của các nhánh được điều chỉnh theo curriculum, bắt đầu từ các trạng thái nhiễu mạnh, phụ thuộc vào điều kiện trang phục và chuyển sang các trạng thái tập trung vào tinh chỉnh chi tiết.
 
@@ -273,27 +277,42 @@ Trên ảnh giải mã, chúng tôi tính RGB reconstruction loss \(\Loss_{\math
 Hàm mục tiêu cuối cùng là
 \begin{equation}
 \Loss= \Loss_{\mathrm{flow}} +\lambda_u\Loss_{\mathrm{unc}} +\lambda_c\Loss_{\mathrm{corr}} +\lambda_e\Loss_{\mathrm{ent}} +\gamma\left( \lambda_r\Loss_{\mathrm{RGB}} +\lambda_h\Loss_{\mathrm{HP}} \right).
+\label{eq:objective}
 \end{equation}
+Ở đây \(\gamma\) là chỉ báo một mẫu được chọn cho loss ảnh: chỉ xét mẫu không bị bỏ điều kiện áo, có \(\bar t_{\mathrm{EDIT}}\geq0.65\), và tối đa một ảnh mỗi microbatch. Trong V46, xác suất chọn thêm là 0.5; từ V47 đến V50 là 1.0. Do đó \(\gamma\) không phải một hằng số tùy chỉnh độc lập. V50 còn có \(0.25\Loss_{\mathrm{attn\text{-}flow}}+0.1\Loss_{\mathrm{spread}}\), giám sát tọa độ trang phục suy ra từ attention theo Leffa \cite{leffa}; hai hạng này chỉ có trong biến thể V50.
 
 \section{Thiết lập thực nghiệm}
 
 \textbf{Dữ liệu.} Chúng tôi sử dụng tập dữ liệu VITON-HD \cite{vitonhd}, gồm 13{,}679 cặp ảnh người -- áo thân trên chụp chính diện, chia thành 11{,}647 cặp huấn luyện và 2{,}032 cặp kiểm thử. Toàn bộ huấn luyện và đánh giá được thực hiện ở độ phân giải \(1024\times768\) (latent \(128\times96\), \(64\times48\) token trên mỗi luồng).
 
-\textbf{Huấn luyện.} Mô hình được học trên các cặp \textit{paired}, trong đó ảnh trang phục tham chiếu \(G\) chính là trang phục xuất hiện trong ảnh đích \(I\). Thiết lập này cung cấp ground truth trực tiếp cho Flow Matching, correspondence supervision và các reconstruction loss trong không gian ảnh. Ở độ phân giải \(1024\times768\), mỗi lần cập nhật dùng batch hiệu dụng \(B=16\) (4 ảnh \(\times\) tích lũy gradient 4 bước), gradient checkpointing và bf16, trên một GPU 48~GB; mô hình được huấn luyện trong tổng cộng \(\textbf{[TRAIN STEPS]}\) bước cập nhật. Không sử dụng EMA.
+\textbf{Tiền xử lý.} Chúng tôi dùng ảnh \textit{agnostic-v3.2}, mặt nạ \textit{agnostic-mask}, DensePose và mặt nạ áo do bộ VITON-HD cung cấp; mã huấn luyện không tạo lại agnostic person từ ảnh gốc. Ảnh RGB được resize Lanczos về \(1024\times768\), đưa về \([-1,1]\); mặt nạ dùng nearest-neighbor và ngưỡng 0.5. Vùng edit được mở thêm bán kính ngẫu nhiên 0--24 pixel khi train, và 12 pixel khi đánh giá, bằng phép giãn mặt nạ; vùng mở thêm trên ảnh agnostic được đặt về màu trung tính. Augmentation gồm tịnh tiến và co giãn độc lập: người/DensePose trong biên \(\pm3\%\), scale \([0.96,1.04]\); áo trong biên \(\pm5\%\), scale \([0.94,1.06]\). Không lật ngang vì màu ngữ nghĩa của DensePose sẽ đổi bên.
 
-\textbf{Suy luận.} Chúng tôi đánh giá mô hình với số bước lấy mẫu \(S\in\{10,30,50\}\) và hệ số classifier-free guidance theo trang phục \(w\in\{1,1.5,2\}\), trong đó \(w=1\) tương ứng với không dùng guidance. Ảnh sinh được ghép (composite) với ảnh agnostic bên ngoài mặt nạ \(M^+\), nên vùng KNOWN được giữ nguyên.
+\textbf{Kiến trúc và khởi tạo.} Backbone là PFT-XL/2 \cite{pf} từ checkpoint \texttt{pft-xl\_step400k\_ema.ckpt}: 28 block Transformer, hidden size 1152, 16 attention head và patch latent \(2\times2\). VAE \texttt{sd\_ae.ckpt} đóng băng; không dùng EMA khi fine-tune PFI-VTON. Phép chiếu điều kiện người khởi tạo bằng 0, phép chiếu áo sao chép bốn kênh latent từ patch embedder PFT; bảng vị trí vuông của PFT được nội suy về lưới \(64\times48\). Ở V48--V50, 7 block cuối còn đọc thêm key/value áo ở lưới \(128\times96\), nhưng backbone 28 block và trọng số self-attention không đổi.
 
-\textbf{Thước đo.} Với thiết lập \textit{paired} (2{,}032 cặp kiểm thử, có ground truth), chúng tôi báo cáo sai số bình phương trung bình (MSE) trên toàn ảnh, SSIM \cite{ssim}, LPIPS \cite{lpips} và FID \cite{fid} giữa tập ảnh sinh và tập ảnh thật. Với thiết lập \textit{unpaired}, mỗi người được ghép với một trang phục khác (theo danh sách cặp unpaired chuẩn của VITON-HD), không có ground truth, nên chúng tôi chỉ báo cáo FID. Chúng tôi chưa tính KID \cite{kid}.
+\textbf{Huấn luyện và provenance.} Mô hình học trên các cặp \textit{paired} với batch 4, tích lũy gradient 4 bước (batch hiệu dụng 16), bf16 và gradient checkpointing trên một GPU 48~GB. Optimizer là AdamW fused với \((\beta_1,\beta_2)=(0.9,0.999)\), \(\epsilon=10^{-8}\), weight decay 0, gradient clipping theo norm 1.0. Lịch learning rate là warm-up tuyến tính 200 bước rồi cosine decay tới 10\% learning rate cực đại. Ở V46, learning rate cực đại của backbone/new embedders lần lượt là \(2\times10^{-5}\)/\(4\times10^{-5}\), horizon 10{,}000 bước; ở V47--V50 là \(10^{-5}\)/\(2\times10^{-5}\), horizon 6{,}000 bước mỗi chặng. Fine garment path ở V48--V50 dùng \(10^{-4}\). Garment dropout cho CFG là 0.1 trên từng ảnh. V46 bắt đầu từ trọng số V44 bước 1250, V47 từ V46 bước 8250, sau đó V48, V49 và V50 lần lượt bắt đầu từ trọng số chặng trước với optimizer mới. \emph{Số bước thực chạy của checkpoint dùng cho Bảng~\ref{tab:sampling} chưa thể xác minh từ artifact hiện có}; không dùng \texttt{max\_steps} làm số bước thực tế. Trước khi nộp bài, cần chép trường \texttt{checkpoint\_step} trong metadata đánh giá vào đây và công bố checkpoint tương ứng.
+
+\textbf{Curriculum và hệ số loss.} Ở V46, \((\pi_0,\pi_S,\pi_D,\pi_L)\) chuyển tuyến tính từ \((0.35,0.25,0,0.40)\) sang \((0.10,0.15,0.40,0.35)\) trong 6000 bước; gate được mở ở bước 0. Tâm logit-normal của LTG chuyển từ \(-1.0\) sang \(0.8\), scale 1, \(\sigma=0.6\), và hệ số dịch thời gian \(a=2\). V47--V50 giữ cố định hỗn hợp cuối và tâm \(0.8\). Trong công thức~\eqref{eq:objective}, V46 dùng \((\lambda_u,\lambda_c,\lambda_e,\lambda_r,\lambda_h)=(0.01,0.10,0.01,0.5,2.0)\); V47--V50 thay \(\lambda_c=0.30\), các hệ số khác giữ nguyên.
+
+\textbf{Suy luận.} Look-ahead \cite{pf} dùng hai lần gọi model mỗi outer step: lần đầu ước lượng vận tốc và uncertainty; khoảng 30\% token edit có uncertainty cao nhất (ngưỡng phân vị \(p=0.7\)) được xem là khó. Các token dễ được đẩy tạm trước một khoảng \(\delta=\min\{\max(t,\Delta t)r,1\}-t\), với mặc định \(r=1.5\); lần gọi thứ hai lấy vận tốc trong bối cảnh này cho token khó, sau đó tất cả cùng tiến \(\Delta t\). Chúng tôi so sánh \(S\in\{8,10,30,50\}\) NFE và \(w\in\{1,1.5,2\}\). CFG chỉ thay điều kiện áo bằng áo/mặt nạ rỗng ở nhánh vô điều kiện; ảnh agnostic, DensePose, mask và timestep giữ nguyên. \(w=1\) cần \(S\) lần gọi person denoiser; \(w>1\) cần \(2S\) lần, dù NFE vẫn là \(S\). Thời gian suy luận là wall-clock GPU đã đồng bộ, tính riêng sampler và chia theo số ảnh. Ảnh đầu ra được ghép với ảnh agnostic bên ngoài \(M^+\). Các số hiện có dùng một seed 42; giao thức mới chạy thêm 123 và 2026 để báo cáo độ lệch chuẩn giữa seed, chưa được xem là kết quả hoàn tất.
+
+\textbf{Thước đo.} Với \textit{paired}, chúng tôi dùng MSE trong \([0,1]\), SSIM \cite{ssim} (cửa sổ Gauss 11, \(\sigma=1.5\)), LPIPS AlexNet \cite{lpips}, FID \cite{fid} và KID \cite{kid} giữa ảnh sinh và ảnh đích. Với \textit{unpaired}, chỉ dùng FID/KID so với tập ảnh người thật của test split, vì không có ground truth theo cặp. FID/KID dùng cùng đặc trưng Inception-v3 pool3 từ \texttt{torch-fidelity} \cite{torchfidelity}; KID là trung bình và độ lệch chuẩn theo 100 tập con, mỗi tập 1000 ảnh, seed 42, báo cáo \(100\times\mathrm{KID}\) trong bảng. Độ lệch chuẩn này khác với độ lệch chuẩn giữa các lần chạy seed. Code đo KID đã được bổ sung, nhưng chưa có số KID mới do evaluator chưa chạy xong trên toàn test split.
 
 \section{Kết quả}
 \subsection{Kết quả định lượng}
 
-\textbf{Ảnh hưởng của số bước lấy mẫu và guidance.} Bảng~\ref{tab:sampling} tổng hợp kết quả trên 2{,}032 cặp kiểm thử. Số bước lấy mẫu là yếu tố ảnh hưởng mạnh nhất tới chất lượng cảm nhận: tăng từ 10 lên 30 bước giảm FID paired từ 12.03 xuống 8.32 và FID unpaired từ 14.03 xuống 10.63 (\(w=1\)); tăng tiếp lên 50 bước chỉ cải thiện thêm khoảng 0.5 FID. Guidance \(w=1.5\) cải thiện FID và LPIPS ở mọi số bước so với \(w=1\), trong khi \(w=2\) không cải thiện thêm (FID unpaired 9.86 so với 9.78 ở 50 bước) và làm tăng MSE, giảm SSIM. Ngược lại, MSE và SSIM tốt nhất đạt được ở cấu hình rẻ nhất (10 bước, \(w=1\)): các thước đo theo điểm ảnh ưu tiên ảnh mượt hơn, trong khi nhiều bước lấy mẫu và guidance tạo ra chi tiết sắc nét hơn nhưng không khớp từng điểm ảnh với ground truth --- đây là đánh đổi quen thuộc giữa độ méo (distortion) và chất lượng cảm nhận. Do đó chúng tôi chọn \(S=50, w=1.5\) làm cấu hình mặc định (FID unpaired thấp nhất, 9.78), và \(S=30, w=1.5\) là lựa chọn cân bằng chi phí với FID unpaired 10.16.
+Các giá trị ở Bảng~\ref{tab:sampling} là kết quả đã ghi trong bản thảo trước khi bổ sung metadata checkpoint, KID và đo thời gian. Vì hiện không có checkpoint hoặc file \texttt{summary.json} tương ứng trong workspace để đối chiếu, bảng được giữ như \emph{kết quả sơ bộ}, không dùng để khẳng định hiệu quả của các ablation mới. Bảng kết quả cuối cùng sẽ chỉ nhận các hàng có checkpoint, seed, cấu hình sampler và danh sách 2032 cặp kiểm thử được lưu kèm.
+
+Bảng~\ref{tab:sampling} trình bày kết quả đánh giá PFI-VTON trên
+2{,}032 cặp ảnh với 9 tổ hợp số bước lấy mẫu và hệ số
+Classifier-Free Guidance (CFG). Kết quả cho thấy số bước lấy mẫu lớn giúp cải thiện FID và LPIPS, trong khi số bước nhỏ đạt MSE và SSIM tốt hơn. Đặc biệt, số bước lấy mẫu bằng 50 với hệ số CFG bằng 1.5--2 cho chất lượng phân phối ảnh tốt nhất,
+cho thấy sự đánh đổi giữa độ trung thực tái tạo và chất lượng cảm nhận.
 
 \begin{table}[!t]
 \centering
 \small
-\caption{Kết quả của PFI-VTON trên tập kiểm thử VITON-HD (\(1024\times768\), 2{,}032 cặp) theo số bước lấy mẫu \(S\) và hệ số guidance \(w\). In đậm: tốt nhất theo từng cột.}
+\caption{Kết quả sơ bộ trong bản thảo: ảnh hưởng của số bước lấy mẫu $S$ và hệ số CFG $w$
+đến hiệu suất PFI-VTON trên VITON-HD (seed 42; chưa có KID/thời gian).
+In đậm biểu thị kết quả tốt nhất theo từng cột.}
 \label{tab:sampling}
 \begin{tabular}{cc cccc c}
 \toprule
@@ -316,12 +335,12 @@ Hàm mục tiêu cuối cùng là
 \end{tabular}
 \end{table}
 
-\textbf{So sánh với các phương pháp khác.} Bảng~\ref{tab:compare} đặt kết quả của PFI-VTON (\(S=50, w=1.5\)) cạnh các số liệu đã công bố trên cùng tập VITON-HD ở cùng độ phân giải \(1024\times768\). Các số liệu của phương pháp khác được trích nguyên văn từ Bảng~1 của FitDiT \cite{fitdit}, Leffa \cite{leffa} và CORAL \cite{coral}; chúng tôi không chạy lại các phương pháp này. Cần lưu ý rằng cùng một phương pháp có thể nhận số liệu khác nhau giữa các bài báo do khác cách cài đặt thước đo và quy trình đánh giá: ví dụ FID paired của IDM-VTON \cite{idmvton} là 6.34 trong \cite{fitdit}, 5.76 trong \cite{leffa} và 6.01 trong \cite{coral}; LPIPS còn chênh lệch lớn hơn (IDM-VTON tự báo cáo LPIPS 0.102 trong \cite{idmvton}, trong khi \cite{leffa} ghi 0.063). Ngoài ra, một số bài báo trích lại số liệu baseline từ bài gốc thay vì tự đánh giá: chẳng hạn hàng CatVTON trong \cite{leffa} trùng với số liệu CatVTON tự báo cáo ở độ phân giải \(512\times384\) \cite{catvton}. Vì chúng tôi tính thước đo bằng quy trình riêng, Bảng~\ref{tab:compare} chỉ mang tính tham khảo về vị trí tương đối, không phải so sánh trực tiếp tuyệt đối.
+\textbf{So sánh với các phương pháp khác.} Bảng~\ref{tab:compare} đặt kết quả sơ bộ của PFI-VTON cạnh các số liệu được trích từ FitDiT \cite{fitdit}, Leffa \cite{leffa} và CORAL \cite{coral}; chúng tôi không chạy lại các phương pháp này. Khi hoàn tất KID, cần xác nhận cùng giao thức và cùng hệ số trình bày KID của từng nguồn trước khi kết luận xếp hạng.
 
 \begin{table}[!t]
 \centering
 \small
-\caption{So sánh trên VITON-HD (\(1024\times768\)). Số liệu các phương pháp khác được trích từ bảng kết quả của bài báo ghi ở cột Nguồn; ``--'' là không có số liệu. PFI-VTON: \(S=50, w=1.5\), đánh giá bằng quy trình của chúng tôi.}
+\caption{So sánh PFI-VTON với các phương pháp VTON trên VITON-HD $1024\times768$). Số liệu đối chứng được trích từ các công bố tương ứng.}
 \label{tab:compare}
 \resizebox{\textwidth}{!}{%
 \begin{tabular}{l cccc cc l}
@@ -348,56 +367,96 @@ IDM-VTON \cite{idmvton} & 0.866 & 0.062 & 6.009 & 0.838 & 9.198 & 1.203 & CORAL 
 CatVTON \cite{catvton} & 0.874 & 0.058 & 5.458 & 0.439 & 9.076 & 1.184 & CORAL \cite{coral} \\
 CORAL \cite{coral} & 0.907 & 0.048 & 4.962 & 0.565 & 8.763 & 0.880 & CORAL \cite{coral} \\
 \midrule
-\textbf{PFI-VTON (ours)} & 0.8719 & 0.1221 & 7.529 & -- & 9.781 & -- & -- \\
+\textbf{PFI-VTON (ours)} & 0.8833 & 0.1219 & 7.489 & -- & 9.781 & -- & -- \\
 \bottomrule
 \end{tabular}}
 \end{table}
 
-Với các lưu ý trên, PFI-VTON đạt FID unpaired 9.78, nằm trong khoảng của các phương pháp diffusion mạnh như IDM-VTON (9.20--9.84) và OOTDiffusion (9.67--12.41 tùy nguồn), nhưng còn kém các phương pháp tốt nhất hiện nay là FitDiT (8.20), Leffa (8.52) và CORAL (8.76). SSIM 0.872 nằm trong khoảng 0.82--0.91 của các phương pháp được liệt kê. Điểm yếu rõ nhất là ở các thước đo paired theo cảm nhận: FID paired 7.53 cao hơn đa số phương pháp diffusion (4.5--6.9), và LPIPS 0.122 cao hơn tất cả các phương pháp diffusion trong bảng (0.048--0.097), tương đương HR-VITON theo số liệu của \cite{leffa}. Như phân tích trong mục \ref{sec:limits}, khoảng cách này chủ yếu đến từ các chi tiết nhỏ của trang phục (chữ, logo nhỏ, hoa văn mảnh), vốn chiếm diện tích nhỏ nhưng ảnh hưởng mạnh đến LPIPS và FID paired.
+Với bảng ~\ref{tab:sampling}, ta có thể thấy rằng PFI-VTON đạt FID unpaired 9.781, nằm trong khoảng của các phương pháp diffusion mạnh IDM-VTON (9.84) và OOTDiffusion (12.41), nhưng còn kém các phương pháp tốt nhất hiện nay là FitDiT (8.20), Leffa (8.52) và CORAL (8.76).Với thiết lập paired, mô hình đạt SSIM 0.88 tốt hơn phần lớn các phương pháp như CatVTON (0.87), IDM-VTON (0.866).
+
+\subsection{Ablation và độ nhạy siêu tham số}
+
+Để kiểm tra từng đóng góp một cách có thể quy nguyên nhân, mọi biến thể huấn luyện dùng cùng \texttt{train\_fit\_pairs.txt}/\texttt{train\_dev\_pairs.txt}, seed 42, batch hiệu dụng 16, số bước cập nhật và learning-rate horizon bằng nhau. Mỗi nhánh bắt đầu từ cùng checkpoint PFT-XL/2, không bắt đầu từ mô hình V50 đã học sẵn thành phần cần loại bỏ. Pilot 1000 bước chỉ kiểm tra tính khả thi; so sánh khoa học dùng 10{,}000 bước mỗi nhánh và đánh giá paired/unpaired 2032 ảnh trên seed 42, 123 và 2026. Các cấu hình được sinh bởi \texttt{scripts/pfi\_ablation\_matrix.py}; không thay đổi số hay shape tham số ở các ablation loss, timestep, role và routing. NFE/time của sampler được đo bằng \texttt{scripts/pfi\_inference\_sweep.py} và \texttt{docs/experiment/infer\_modal.py}.
+
+\begin{table}[!t]
+\centering\small
+\caption{Ma trận thực nghiệm bổ sung. Các giá trị là cấu hình cần chạy, không phải kết quả đo.}
+\label{tab:ablation_protocol}
+\begin{tabular}{p{0.28\linewidth}p{0.65\linewidth}}
+\toprule
+Nhóm & Biến thể so với baseline \\
+\midrule
+Trọng số công thức~\eqref{eq:objective} & \(\lambda_u\in\{0,0.005,0.01,0.02\}\); \(\lambda_c\in\{0,0.05,0.10,0.20\}\); \(\lambda_e\in\{0,0.005,0.01,0.02\}\); \(\lambda_r\in\{0,0.25,0.5,1\}\); \(\lambda_h\in\{0,1,2,4\}\); bỏ đồng thời RGB và HP. \\
+Curriculum & Cố định hỗn hợp đầu/cuối; ramp 3000/6000/9000 bước; ưu tiên noise ở đầu hoặc detail ở cuối; từng nhánh noise/sync/detail/LTG riêng lẻ. \\
+LTG & \(\sigma\in\{0.3,0.6,0.9\}\), giữ mọi tham số còn lại. \\
+Điều kiện và attention & Timestep riêng theo patch so với một timestep chung lấy từ cùng phân phối biên; asymmetric so với full attention trên hai luồng; tắt role embedding, tắt timestep embedding AdaLN, và tắt cả hai. \\
+Backbone & 24 so với 28 block với hidden 1152/head 16; 8 so với 16 head với hidden 1152; PFT-B/2 (12/768/12) so với PFT-XL/2 (28/1152/16). \\
+Look-ahead & \(r\in\{0.75,1.5,2.5\}\) với 8 và 10 NFE; Euler/dual-loop 8 và look-ahead 30/50 để so sánh chất lượng--chi phí. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Trường hợp \(\lambda_c=0\) loại bỏ correspondence loss; \(\lambda_e=0\) chỉ bỏ entropy; \(\lambda_u=0\) chỉ bỏ giám sát uncertainty, trong khi đầu dự đoán vẫn tồn tại để sampler chạy được. Khi bỏ cả RGB và HP, các loss latent khác vẫn giữ nguyên. Để cô lập ảnh hưởng phân phối thời gian, toàn bộ nhánh so sánh curriculum, $\sigma$ LTG và từng loại timestep đều tắt RGB/HP và dùng biến thể \texttt{no\_rgb\_hp} làm control: loss ảnh vốn chỉ bật khi \(t\geq0.65\), nên nếu giữ nó, nhánh noise-only sẽ bị mất thêm giám sát ngoài ý muốn. Baseline hai luồng đã có garment self-attention nhưng không cho garment nhìn person; biến thể full attention cho cả hai luồng nhìn nhau bằng chính Q/K/V và block hiện hữu, không thêm tham số. Do garment phụ thuộc person ở biến thể này, không dùng cache K/V khi suy luận và phải báo cáo thêm thời gian. Biến thể PFT-B đổi đồng thời độ sâu, hidden size và head, nên chỉ là so sánh quy mô; cấu hình 8 head có một phần Q/K normalization không nạp được từ checkpoint 16 head và không được diễn giải như thí nghiệm cô lập số head. Chúng tôi sẽ chỉ kết luận về ảnh hưởng riêng của kiến trúc khi có checkpoint tiền huấn luyện tương ứng hoặc huấn luyện mọi cỡ từ cùng điều kiện khởi tạo.
+
+\emph{Trạng thái:} ma trận cấu hình, cờ ablation và evaluator đã được viết; chưa có kết quả ablation/KID mới để điền vào bảng số. Cần chạy đủ pilot, full budget và nhiều seed rồi mới báo cáo trung bình, độ lệch chuẩn và kiểm tra chữ/logo trên cùng danh sách ảnh.
 
 \subsection{Kết quả định tính}
 
-Hình~\ref{fig:qual_good} và Hình~\ref{fig:qual_fail} trình bày kết quả paired trên tập kiểm thử (mỗi hàng: trang phục tham chiếu, ảnh agnostic, ground truth, PFI-VTON). PFI-VTON giữ đúng hình dáng, độ dài và màu của trang phục, khớp tư thế người, và bảo toàn tốt các logo cỡ lớn với nét dày như FILA, DKNY hay Levi's; các họa tiết hoa lặp lại được tái tạo hợp lý về bố cục và màu sắc. Vùng KNOWN (mặt, tóc, quần, nền) được giữ nguyên nhờ composite.
+\textbf{Paired.} Hình~\ref{fig:qual_good} và Hình~\ref{fig:qual_fail} trình bày kết quả paired trên tập kiểm thử (mỗi hàng: trang phục tham chiếu, ảnh agnostic, ground truth, PFI-VTON). PFI-VTON giữ đúng hình dáng, độ dài và màu của trang phục, khớp tư thế người, và bảo toàn tốt các logo cỡ lớn với nét dày như FILA, DKNY hay Levi's; các họa tiết hoa lặp lại được tái tạo hợp lý về bố cục và màu sắc. Vùng KNOWN (mặt, tóc, quần, nền) được giữ nguyên.
 
-Hình~\ref{fig:qual_fail} cho thấy các trường hợp thất bại điển hình: chữ viết tay mảnh (logo Champion) bị sai ký tự; các chi tiết nhỏ và dày đặc (hình nhân vật đính đá) bị đơn giản hóa; họa tiết hình học có cấu trúc chính xác (vòng tròn sọc ngang) bị lệch và đứt nét. Ngoài ra, ở một số ảnh xuất hiện quầng sáng mờ (halo) quanh cơ thể, bên trong vùng mặt nạ nhưng ngoài trang phục (ví dụ quanh vai trong ảnh Levi's và áo hoa vàng ở Hình~\ref{fig:qual_good}).
+Hình~\ref{fig:qual_fail} cho thấy các trường hợp còn hạn chế trong thiết lập paired: chữ viết tay mảnh (logo Champion) bị sai ký tự; các chi tiết nhỏ và dày đặc (hình nhân vật đính đá) bị đơn giản hóa; họa tiết hình học giữ được cấu trúc màu sắc nhưng chưa sắc nét vẫn con hiện bị nhòe ở một số vi trí.
 
 \begin{figure}[!t]
 \centering
-\includegraphics[width=0.92\textwidth]{2aOboR3cCHzy7qIL7tETx9HxEAJtXN5EvfpdFmrI.jpg}\\[2pt]
-\includegraphics[width=0.92\textwidth]{2aOboR3cCPOpSuHknJEdF6SFxvabPQCoPGl1zmhE.jpg}\\[2pt]
-\includegraphics[width=0.92\textwidth]{2aOboR3cCX0WGeB83d3FZH82voxcjoTJdULXkCie.jpg}\\[2pt]
-\includegraphics[width=0.92\textwidth]{2aOboR3cCTVC3afN0Th6qHlmkQhDwdcKgAJxEPY0.jpg}
-\caption{Kết quả paired trên tập kiểm thử VITON-HD. Từ trái sang phải: trang phục tham chiếu, ảnh agnostic, ground truth, PFI-VTON. Logo lớn và họa tiết lặp được bảo toàn tốt; hàng 3--4 có quầng sáng mờ quanh vai.}
+\includegraphics[width=0.92\textwidth]{paired/2aOboR3cCHzy7qIL7tETx9HxEAJtXN5EvfpdFmrI.jpg}\\[2pt]
+\includegraphics[width=0.92\textwidth]{paired/2aOboR3cCPOpSuHknJEdF6SFxvabPQCoPGl1zmhE.jpg}\\[2pt]
+\includegraphics[width=0.92\textwidth]{paired/2aOboR3cCX0WGeB83d3FZH82voxcjoTJdULXkCie.jpg}\\[2pt]
+\includegraphics[width=0.92\textwidth]{paired/2aOboR3cCTVC3afN0Th6qHlmkQhDwdcKgAJxEPY0.jpg}
+\caption{Kết quả paired trên tập kiểm thử VITON-HD. Từ trái sang phải: trang phục tham chiếu, ảnh agnostic, ground truth, PFI-VTON.}
 \label{fig:qual_good}
 \end{figure}
 
 \begin{figure}[!t]
 \centering
-\includegraphics[width=0.92\textwidth]{2aOboR3cDLViTWQ6poWleakxPfrOWhYi3AjPCH0i.jpg}\\[2pt]
-\includegraphics[width=0.92\textwidth]{2aOboR3cCL4Dpy6WrlUoDZFYRZbEWkCoD4vQyoGu.jpg}\\[2pt]
-\includegraphics[width=0.92\textwidth]{2aOboR3cD0BMJpjlSWSKOYUgotcQJPAYltizp5Si.jpg}
-\caption{Các trường hợp thất bại: chữ viết mảnh bị sai ký tự (Champion), chi tiết nhỏ dày đặc bị đơn giản hóa (hình nhân vật đính đá), họa tiết hình học bị lệch (vòng tròn sọc). Thứ tự cột như Hình~\ref{fig:qual_good}.}
+\includegraphics[width=0.92\textwidth]{paired/2aOboR3cDLViTWQ6poWleakxPfrOWhYi3AjPCH0i.jpg}\\[2pt]
+\includegraphics[width=0.92\textwidth]{paired/2aOboR3cCL4Dpy6WrlUoDZFYRZbEWkCoD4vQyoGu.jpg}\\[2pt]
+\includegraphics[width=0.92\textwidth]{paired/2aOboR3cD0BMJpjlSWSKOYUgotcQJPAYltizp5Si.jpg}
+\caption{Các trường hợp hạn chế: chữ viết mảnh bị sai ký tự (Champion), chi tiết nhỏ dày đặc bị đơn giản hóa (hình nhân vật đính đá), họa tiết hình học bị nhòe ở một số vị trí (vòng tròn sọc). Thứ tự cột như Hình~\ref{fig:qual_good}.}
 \label{fig:qual_fail}
+\end{figure}
+
+\textbf{Unpaired.} Thiết lập unpaired khó hơn vì trang phục tham chiếu thường khác trang phục ban đầu về độ dài tay, cổ áo, độ rộng và màu sắc. Hình~\ref{fig:unpaired_good} cho thấy PFI-VTON chuyển được thành công hình dáng, đặc trưng của trang phục mới thay vì sao chép hình dáng cũ: áo dài tay được thay bằng áo ngắn tay và phần cánh tay bị che được sinh lại tự nhiên, áo cổ thắt nơ giữ đúng chi tiết nơ và độ dài tay áo, và các logo (DKNY, BOSS với hiệu ứng chữ sờn) được giữ đúng ký tự.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=0.92\textwidth]{unpaired/2aOboR3mMSOrkyxeJJUPYRqzmUsbUnobT7VpCyn2.jpg}\\[2pt]
+\includegraphics[width=0.92\textwidth]{unpaired/2aOboR3mMUrglGUBr5uUVJAUDSONW8KO1LznANqi.jpg}\\[2pt]
+\includegraphics[width=0.92\textwidth]{unpaired/2aOboR3mMbg3mCn3PP2yjnLXusNS4dXDbYL8UmUC.jpg}\\[2pt]
+\includegraphics[width=0.92\textwidth]{unpaired/2aOboR3mMe5rTDoPCCALghR837pBih7JgIKQuYls.jpg}
+\caption{Kết quả unpaired trên tập kiểm thử VITON-HD. Từ trái sang phải: trang phục tham chiếu, ảnh agnostic, ảnh người ban đầu (đang mặc trang phục khác), PFI-VTON.}
+\label{fig:unpaired_good}
+\end{figure}
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=0.92\textwidth]{unpaired/2aOboR3mMpdMUcnQGpK3XNpF1YVXFv8jdHx5D4RU.jpg}\\[2pt]
+\includegraphics[width=0.92\textwidth]{unpaired/2aOboR3mJolg72yvp5mOpinhZXm5acYrhft5VzJw.jpg}\\[2pt]
+\includegraphics[width=0.92\textwidth]{unpaired/2aOboR3mMlC7kpU8HBrwqszaXGNy7fzr00CcPQUy.jpg}\\[2pt]
+\includegraphics[width=0.92\textwidth]{unpaired/2aOboR3mJVEi7zUoSJ8J6bTzi1JfOgu2k2vmahns.jpg}
+\caption{Kết quả unpaired trên tập kiểm thử VITON-HD. Từ trái sang phải: trang phục tham chiếu, ảnh agnostic, ảnh người ban đầu (đang mặc trang phục khác), PFI-VTON (tiếp).}
+\label{fig:unpaired_fail}
 \end{figure}
 
 \section{Thảo luận và giới hạn}
 \label{sec:limits}
 
-\textbf{Chi tiết nhỏ: chữ và logo.} Đây là giới hạn chính của PFI-VTON ở \(1024\times768\). Mỗi token của DiT bao phủ \(16\times16\) điểm ảnh, lớn hơn bề rộng nét chữ nhỏ, nên một person token phải tổng hợp nhiều nét từ cùng một garment token. Phân tích attention trong quá trình huấn luyện cho thấy phân phối person-to-garment attention còn phân tán: chỉ khoảng 4\% khối lượng attention của các head được giám sát bằng CORAL rơi vào đúng garment token tương ứng do DINOv3 xác định, và khoảng 60\% rơi ra ngoài lân cận vài token quanh vị trí đó. Khi attention phân tán, đặc trưng đọc được là trung bình của nhiều nét lân cận, dẫn tới hình chữ đúng bố cục nhưng sai ký tự. Chúng tôi đã thử cung cấp garment key/value ở độ phân giải latent (\(8\times8\) điểm ảnh) cho các block cuối, nhưng hàm mất mát hiện tại không tạo động lực để mô hình sử dụng nhánh này. Giám sát tương ứng ở mức điểm ảnh, chẳng hạn warp ảnh trang phục bằng chính attention như Leffa \cite{leffa}, là hướng cải tiến trực tiếp cho vấn đề này.
+\textbf{Chi tiết nhỏ: chữ và logo.} Đây là giới hạn chính của PFI-VTON ở \(1024\times768\). Mỗi token của DiT bao phủ \(16\times16\) điểm ảnh, lớn hơn bề rộng nét chữ nhỏ, nên một person token phải tổng hợp nhiều nét từ cùng một garment token. Phân tích attention trong quá trình huấn luyện cho thấy phân phối person-to-garment attention còn phân tán: chỉ khoảng 4\% trọng số attention của các head được giám sát bằng CORAL rơi đúng vào garment token tương ứng do DINOv3 xác định, và khoảng 60\% rơi ra ngoài lân cận vài token quanh vị trí đó. Khi attention phân tán, đặc trưng trở thành trung bình của nhiều vùng lân cận, dẫn tới hình chữ đúng bố cục nhưng sai ký tự.
 
-\textbf{Khoảng cách về LPIPS và FID paired.} Như Bảng~\ref{tab:compare} cho thấy, PFI-VTON cạnh tranh về FID unpaired nhưng kém rõ ở LPIPS và FID paired --- hai thước đo nhạy với sai lệch chi tiết so với ground truth. Đánh đổi giữa MSE/SSIM và FID theo số bước lấy mẫu (Bảng~\ref{tab:sampling}) cũng cho thấy không có cấu hình suy luận nào tối ưu đồng thời mọi thước đo.
-
-\textbf{Thành phần lỗi ở biên mặt nạ.} Quầng sáng mờ quanh cơ thể xuất phát từ vùng mặt nạ được mở rộng \(M^+\): mô hình phải tự sinh nền và da ở phần mặt nạ nằm ngoài trang phục mới, và đôi khi để lại dấu vết mờ của hình dáng ban đầu.
-
-\textbf{Chi phí suy luận.} Chất lượng tốt nhất cần 50 bước lấy mẫu, và guidance theo trang phục cần thêm một lượt dự đoán không điều kiện ở mỗi bước. Với 10 bước, FID tăng đáng kể (Bảng~\ref{tab:sampling}), nên lợi thế lấy mẫu nhanh của Patch Forcing chưa được khai thác hết trong bài toán VTON ở độ phân giải cao.
-
-\textbf{Mở rộng độ phân giải từ mô hình tiền huấn luyện.} DiT gốc được tiền huấn luyện ở lưới \(16\times16\) token; positional embedding được nội suy lên lưới \(64\times48\), làm các token kề nhau có vị trí rất gần nhau. Điều này có thể hạn chế khả năng phân biệt vị trí chính xác cần cho chi tiết nhỏ.
-
-\textbf{Phạm vi đánh giá.} Chúng tôi chỉ đánh giá trên VITON-HD (áo thân trên, chụp chính diện, nền studio), chưa đánh giá trên DressCode hay ảnh ngoài thực tế, chưa tính KID, và tính các thước đo bằng quy trình riêng; do đó so sánh với các bài báo khác trong Bảng~\ref{tab:compare} chỉ mang tính tham khảo.
+\textbf{Thành phần lỗi ở biên mặt nạ.} Quầng sáng mờ quanh cơ thể xuất phát từ vùng mặt nạ được mở rộng \(M^+\): mô hình phải tự sinh nền và da ở phần mặt nạ nằm ngoài trang phục mới, và đôi khi để lại dấu vết mờ của hình dáng ban đầu. Lỗi này rõ hơn khi trang phục mới hẹp hoặc ngắn hơn trang phục cũ, vì khi đó vùng nền phải sinh ra lớn hơn. Tuy nhiên vấn đề này có thể giải quyết đơn giản bằng một blend ở biên mặt nạ.
 
 \section{Kết luận}
 
-Chúng tôi đã trình bày PFI-VTON, một cách tiếp cận thử đồ ảo dựa trên Patch Forcing, trong đó VTON được biểu diễn như bài toán inpainting theo patch trong không gian latent: các patch vùng trang phục mang timestep riêng, trang phục tham chiếu được mã hóa thành một luồng token sạch dùng chung DiT tiền huấn luyện và truyền thông tin một chiều sang luồng người, sự tương ứng người--trang phục được giám sát bằng CORAL với DINOv3, và phân phối timestep được lên lịch để mô hình học từ bố cục tới chi tiết. Không cần mạng warping hay dán điểm ảnh từ trang phục, PFI-VTON sinh trực tiếp ảnh \(1024\times768\) trên VITON-HD với FID unpaired 9.78 và SSIM 0.872, cạnh tranh với các phương pháp diffusion như IDM-VTON và OOTDiffusion, và giữ tốt hình dáng, màu sắc và logo cỡ lớn. Tuy nhiên, mô hình còn kém các phương pháp tốt nhất về LPIPS và FID paired, chủ yếu do chưa tái tạo đúng chữ và logo nhỏ. Hướng phát triển tiếp theo gồm giám sát tương ứng ở mức điểm ảnh, garment token độ phân giải cao hơn, giảm số bước lấy mẫu cần thiết, và mở rộng đánh giá sang DressCode và ảnh ngoài thực tế.
+Chúng tôi đã trình bày PFI-VTON, một cách tiếp cận thử đồ ảo dựa trên Patch Forcing, trong đó VTON được biểu diễn dưới dạng một bài toán inpainting trong không gian ẩn. Các patch vùng trang phục mang timestep riêng, trang phục tham chiếu được mã hóa thành một luồng token sạch cung cấp thông tin một chiều sang luồng token người. Sự tương ứng người--trang phục được giám sát bằng CORAL với DINOv3. Phân phối timestep của các patch được lên lịch để mô hình học từ bố cục tới chi tiết. Không cần mạng warping, PFI-VTON sinh trực tiếp ảnh \(1024\times768\) trên VITON-HD. Bảng kết quả sơ bộ ghi nhận FID unpaired 9.781 và SSIM 0.883, nhưng cần xác minh checkpoint và chạy lại KID, nhiều seed cùng ablation trước khi kết luận mức đóng góp của từng thành phần. Tuy nhiên, mô hình còn kém hơn các phương pháp tốt nhất về LPIPS và FID paired, chủ yếu do chưa tái tạo đúng chữ và logo nhỏ. Hướng phát triển tiếp theo, chúng tôi sẽ giám sát tương ứng ở mức độ điểm ảnh, nâng độ phân giải của garment token, giảm số bước lấy mẫu cần thiết, và mở rộng đánh giá sang DressCode và ảnh ngoài thực tế.
 
 
 \begin{thebibliography}{99}
@@ -417,5 +476,6 @@ Chúng tôi đã trình bày PFI-VTON, một cách tiếp cận thử đồ ảo
 \bibitem{ootd} Y. Xu, T. Gu, W. Chen, C. Chen. \emph{OOTDiffusion: Outfitting Fusion based Latent Diffusion for Controllable Virtual Try-on}. arXiv:2403.01779, 2024. \url{https://arxiv.org/abs/2403.01779}.
 \bibitem{fid} M. Heusel, H. Ramsauer, T. Unterthiner, B. Nessler, S. Hochreiter. \emph{GANs Trained by a Two Time-Scale Update Rule Converge to a Local Nash Equilibrium}. NeurIPS, 2017. \url{https://arxiv.org/abs/1706.08500}.
 \bibitem{kid} M. Bińkowski, D. J. Sutherland, M. Arbel, A. Gretton. \emph{Demystifying MMD GANs}. ICLR, 2018. \url{https://arxiv.org/abs/1801.01401}.
+\bibitem{torchfidelity} A. Obukhov, M. Seitzer, P.-W. Wu, S. Zhydenko, J. Kyl, E. Y.-J. Lin. \emph{High-fidelity performance metrics for generative models in PyTorch}. Zenodo, 2020, doi:10.5281/zenodo.3786539. \url{https://github.com/toshas/torch-fidelity}.
 \end{thebibliography}
 \end{document}
