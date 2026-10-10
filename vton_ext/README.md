@@ -63,7 +63,7 @@ Tải [VITON-HD 1024 × 768 đã tiền xử lý](https://github.com/shadow2496/
   test/...   test_pairs.txt (unpaired)   test_pairs_paired.txt
 ```
 
-**Cảnh báo:** `train_pairs.txt` trong một số bản ZIP gần như toàn cặp *unpaired*. Train trên file đó làm model học tái tạo một áo khác áo điều kiện; xem [biên bản sự cố V46](../docs/v46_resume_regression_audit_20260927.md). Tạo danh sách fit/dev paired, cùng định danh người–áo, giữ nguyên tập test chính thức:
+**Cảnh báo:** `train_pairs.txt` trong một số bản ZIP gần như toàn cặp *unpaired*. Train trên file đó làm model học tái tạo một áo khác áo điều kiện. Tạo danh sách fit/dev paired, cùng định danh người–áo, giữ nguyên tập test chính thức:
 
 ```bash
 python -m scripts.prepare_pfi_pairs --root ../high-resolution-viton-zalando-dataset \
@@ -76,41 +76,7 @@ python -m scripts.prepare_pfi_pairs --root ../high-resolution-viton-zalando-data
 - **Bảo vệ khi resume:** checkpoint lưu fingerprint fit/dev, và trainer từ chối `--resume` nếu danh sách thay đổi.
 - **Bảo vệ khi khởi tạo:** các nhánh ablation bật thêm `weights.init_pairs_must_match`, nên trainer cũng kiểm tra fingerprint khi khởi tạo từ checkpoint.
 
-## 3. Lịch sử huấn luyện của V50
-
-V50 là kết quả của nhiều chặng nối tiếp, không phải một lần train. Batch hiệu dụng luôn là 16 (4 ảnh × tích lũy 4). Mọi chặng dùng:
-- AdamW (β = 0,9 / 0,999), weight decay 0;
-- clip gradient 1,0; không dùng EMA;
-- warm-up tuyến tính, sau đó cosine giảm còn 10%.
-
-| Chặng | Độ phân giải | Khởi tạo | Số bước | Thay đổi chính | LR (mới / backbone) |
-| --- | --- | --- | ---: | --- | --- |
-| V40–V42 | 512 × 384 | PFT-XL/2 | 16.000 | Hai luồng, CoRAL; curriculum mở theo `coral_local_mass` ≥ 0,30; decoded RGB/HP từ V42 | 1e-4 / 2e-5, horizon 20k |
-| V43 | 1024 × 768 | V42 bước 16.000 | 1.000 | Chuyển lên 1024 | 1e-5 / 5e-6 |
-| V44 | 1024 × 768 | V43 bước 1.000 | 1.250 | Decoded loss trên toàn ảnh | 1e-5 / 5e-6 |
-| V46 c2f | 1024 × 768 | V44 bước 1.250 | 1.500 | Curriculum thô → mịn theo bước | 4e-5 / 2e-5 |
-| V46 recovery | 1024 × 768 | V46 c2f bước 1.500 | 8.250 | Chạy lại trên danh sách paired sạch | 4e-5 / 2e-5 |
-| V47 | 1024 × 768 | V46 recovery bước 8.250 | 1.000 | Oversample áo có chữ/logo, CoRAL 0,3 | 2e-5 / 1e-5 |
-| V48 | 1024 × 768 | V47 bước 1.000 | 5.500 | Fine garment K/V (residual trước LayerNorm, không học được) | 2e-5 / 1e-5, fine 1e-4 |
-| V49 | 1024 × 768 | V48 bước 5.500 | 4.750 | Fine residual sau LayerNorm | như V48 |
-| V50 | 1024 × 768 | V49 bước 4.750 | xem `checkpoint_step` | Attention-flow loss (Leffa) | như V48 |
-
-Lấy số bước thật của V50 từ `metadata.json` của lần đánh giá (trường `checkpoint_step`). Không đoán con số này.
-
-Tham số chung từ V46 trở đi:
-
-| Nhóm | Giá trị |
-| --- | --- |
-| Time shift | 2 khi train, 1 khi lấy mẫu |
-| LTG | σ = 0,6, scale 1 |
-| Curriculum V46 | Bắt đầu: noise 0,35 / sync 0,25 / detail 0, loc −1. Kết thúc: 0,10 / 0,15 / 0,40, loc 0,8. Ramp tuyến tính 6.000 bước. Phần còn lại là LTG. Từ V47 giữ cố định hỗn hợp cuối |
-| Nhánh detail | t̄ ∈ [0,75; 0,98], độ lệch chuẩn 0,05, không qua time shift |
-| Trọng số loss | flow 1; uncertainty 0,01; CoRAL 0,3 (0,1 trước V47); entropy 0,01; RGB 0,5; HP 2,0 (vùng chữ/logo ×2, chỉ ảnh có t ≥ 0,65, 1 ảnh/microbatch); attention flow 0,25; spread 0,1 |
-| Augment | Người: dịch 3%, scale 0,96–1,04. Áo: dịch 5%, scale 0,94–1,06 |
-| Mặt nạ | Mở rộng 0–24 px khi train, 12 px khi suy luận; vùng mở rộng tô xám |
-| CFG | Garment dropout 0,1 (áo và mặt nạ áo đặt về 0) |
-
-## 4. Train và resume
+## 3. Train và resume
 
 Mỗi version có một launcher. Launcher tự resume nếu `latest.pt` của run đó đã tồn tại:
 
@@ -130,7 +96,7 @@ PYTHONPATH=. python -m vton_ext.pfi_train --config configs/vton_v50_attn_flow.ya
 - **Override:** viết `key=value` sau đường dẫn config.
 - **Bộ nhớ:** V50 ở 1024 × 768 dùng khoảng 38–40 GB VRAM và khoảng 21 s/bước trên RTX 4090 48 GB. `latest.pt` nặng khoảng 8 GB, và cần thêm khoảng 8 GB trống trong lúc lưu.
 
-## 5. Ablation
+## 4. Ablation
 
 Các nhánh ablation **không so với V50**, vì V50 có lịch sử dài và nhiều chặng. Thay vào đó, mọi nhánh khởi tạo từ cùng `logs/v46/step0001500.pt`:
 - đây là V46 paired recovery ở bước 1.500, chỉ chứa trọng số, đã kiểm tra fingerprint sạch;
@@ -165,7 +131,7 @@ Những gì **không** ablate, và lý do:
 - **Uncertainty loss:** sampler look-ahead cần log-variance dự đoán để chọn token khó, nên tắt loss này thì sampler mất ý nghĩa.
 - **σ của LTG ≥ 0,5:** không có tác dụng. Độ lệch chuẩn thực tế là `min(t̄/2, σ)` và t̄ < 1, nên σ = 0,6 và σ = 0,9 sinh ra đúng cùng các timestep.
 
-## 6. Đánh giá
+## 5. Đánh giá
 
 [`docs/experiment/infer_modal.py`](../docs/experiment/infer_modal.py) chạy trên Modal (H100, volume `VTON-HD`). Mỗi job đánh giá một checkpoint với một cấu hình sampler, trên toàn bộ 2.032 cặp paired và unpaired của tập test. Script báo cáo:
 - MSE, SSIM, LPIPS (AlexNet);
@@ -197,7 +163,7 @@ Lưu ý khi diễn giải kết quả:
 - **Một seed train mỗi nhánh:** chênh lệch nhỏ hơn độ lệch theo seed lấy mẫu thì chưa đủ để kết luận.
 - **Xem ảnh crop:** luôn xem crop vùng áo và logo bên cạnh các con số, vì FID/KID không cho biết chữ có đúng hay không.
 
-## 7. Kiểm thử
+## 6. Kiểm thử
 
 ```bash
 PYTHONPATH=. /home/minh-le-vo-nhat/anaconda3/envs/vt-env/bin/python tests/test_pfi.py   # 42 test, CPU
