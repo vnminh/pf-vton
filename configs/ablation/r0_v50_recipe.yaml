@@ -32,7 +32,7 @@ optim:
   warmup_steps: 200
 
 train:
-  max_steps: 5000            # cosine LR horizon = number of updates
+  max_steps: 6000            # cosine LR horizon = number of updates
   output_dir: logs/ablation/r0_v50_recipe
   save_every: 250            # resumable latest.pt
   keep_every: 1000           # bf16 weight snapshots for later evaluation
