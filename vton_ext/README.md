@@ -6,7 +6,7 @@ Mô hình cuối là **V50** (`configs/vton_v50_attn_flow.yaml`), gồm:
 - garment K/V mịn (8 px) ở các block cuối;
 - các loss: CoRAL, decoded RGB/high-pass, uncertainty và attention-flow.
 
-Ablation và đánh giá nằm ở mục 5–6. Các file đánh giá cụ thể ở [`docs/experiment/`](../docs/experiment/README.md).
+Ablation ở mục 4, đánh giá ở mục 5. Các file đánh giá cụ thể ở [`docs/experiment/`](../docs/experiment/README.md).
 
 Mã nguồn chính:
 
@@ -133,35 +133,81 @@ Những gì **không** ablate, và lý do:
 
 ## 5. Đánh giá
 
-[`docs/experiment/infer_modal.py`](../docs/experiment/infer_modal.py) chạy trên Modal (H100, volume `VTON-HD`). Mỗi job đánh giá một checkpoint với một cấu hình sampler, trên toàn bộ 2.032 cặp paired và unpaired của tập test. Script báo cáo:
-- MSE, SSIM, LPIPS (AlexNet);
-- FID và KID (torch-fidelity, cùng đặc trưng Inception; KID 100 tập con × 1.000 ảnh);
-- thời gian lấy mẫu (giây/ảnh, đã đồng bộ GPU);
-- số lượt gọi model và denoiser mỗi ảnh (CFG làm số lượt gọi denoiser tăng gấp đôi).
+### 5.1. Trên server (cách chính)
 
-Mỗi cấu hình cần một `--output-tag` riêng.
+[`scripts/eval_pfi_test.sh`](../scripts/eval_pfi_test.sh) gọi [`scripts/eval_pfi_test.py`](../scripts/eval_pfi_test.py). Script đánh giá một checkpoint trên toàn bộ tập test VITON-HD: 2.032 cặp paired và 2.032 cặp unpaired. Cần GPU CUDA và các gói `lpips`, `torchmetrics`, `torch-fidelity` (`pip install lpips "torchmetrics[image]" torch-fidelity`).
 
 ```bash
-# V50: độ lệch theo seed lấy mẫu (3 seed), CFG 1,5, look-ahead 50 NFE
-for s in 42 123 2026; do modal run docs/experiment/infer_modal.py --nfe 50 --cfg-scales 1.5 --seed $s \
-    --output-tag v50-la50-cfg1.5-seed$s; done
-# V50: timestep riêng theo token (look-ahead) so với một timestep chung (Euler)
+# Chạy thử 16 mẫu trước để kiểm tra môi trường
+LIMIT=16 bash scripts/eval_pfi_test.sh logs/vton-v50-attn-flow/latest.pt
+# V50 đầy đủ: look-ahead 50 NFE, CFG 1,5, seed 42 (mặc định)
+bash scripts/eval_pfi_test.sh logs/vton-v50-attn-flow/latest.pt
+# Nhiều CFG trong một lần chạy; seed khác
+CFG_SCALES=1,1.5,2 SEED=123 bash scripts/eval_pfi_test.sh logs/vton-v50-attn-flow/latest.pt
+# Nhánh ablation: truyền config của nhánh làm tham số thứ hai; tham số sau đó chuyển thẳng cho file .py
+bash scripts/eval_pfi_test.sh logs/ablation/e1_shared_timestep/latest.pt configs/ablation/e1_shared_timestep.yaml --sampler euler
+# Lưu thêm ảnh ghép 4 cột cho mỗi mẫu; chỉ chạy paired
+bash scripts/eval_pfi_test.sh logs/vton-v50-attn-flow/latest.pt configs/vton_v50_attn_flow.yaml --save-strips --settings pair
+```
+
+- **Tham số dòng lệnh:**
+  - tham số đầu tiên là checkpoint;
+  - tham số thứ hai (không bắt buộc) là config, mặc định `configs/vton_v50_attn_flow.yaml`;
+  - các tham số còn lại chuyển thẳng cho `eval_pfi_test.py`, gồm `--sampler`, `--p`, `--context-ratio`, `--settings`, `--save-strips`, `--no-fid` và `--overwrite`.
+- **Biến môi trường:** `DATA_ROOT` (mặc định `../high-resolution-viton-zalando-dataset`), `SAMPLER`, `NFE`, `CFG_SCALES`, `SEED`, `BATCH_SIZE`, `LIMIT`, `PY` (đường dẫn Python), `OUT` (thư mục kết quả).
+- **Thư mục kết quả mặc định:** `outputs/eval/<tên run>-<sampler><NFE>-cfg<w>-seed<s>/`.
+- **Danh sách paired:** paired nghĩa là mỗi người trong `test/image` mặc lại đúng áo của mình, tổng cộng 2.032 cặp. Một số bản tải về có `test_pairs_paired.txt` thiếu dòng; bản ở máy local chỉ có 1.953 dòng. Khi đó script tự tạo danh sách đầy đủ `test_pairs_paired_full.txt` trong thư mục kết quả, in cảnh báo và ghi số dòng vào `metadata.json`.
+
+Kết quả lưu cho **từng mẫu**:
+
+```text
+<OUT>/metadata.json               checkpoint (đường dẫn, bước, kích thước), config, sampler, NFE, seed, p, context ratio, GPU
+<OUT>/summary.json                tổng hợp mọi CFG và thiết lập
+<OUT>/eval.log                    log
+<OUT>/cfg<w>/pair/pred/<person>.png      ảnh dự đoán 1024 × 768 (đã ghép với ảnh agnostic)
+<OUT>/cfg<w>/pair/strip/<person>.jpg     (với --save-strips) áo | agnostic | ảnh gốc / ground truth | dự đoán
+<OUT>/cfg<w>/pair/per_sample.csv         index, person, garment, mse, mse_mask, ssim, lpips, sample_seconds
+<OUT>/cfg<w>/pair/summary.json           trung bình MSE / MSE trong mặt nạ / SSIM / LPIPS, FID, KID, thời gian
+<OUT>/cfg<w>/unpair/...                  như trên; per_sample.csv chỉ có tên ảnh và thời gian (không có ground truth)
+```
+
+Các thước đo:
+- **MSE:** trên ảnh [0, 1]. `mse_mask` là MSE chỉ trong vùng mặt nạ edit.
+- **SSIM:** cửa sổ Gauss 11, σ 1,5.
+- **LPIPS:** AlexNet.
+- **FID và KID:** tính bằng torch-fidelity, dùng chung đặc trưng Inception; so với `test/image`, tức ground truth ở paired và ảnh người thật ở unpaired. KID dùng 100 tập con × 1.000 ảnh và tự tắt khi ít hơn 1.000 mẫu.
+- **Thời gian:** giây GPU cho mỗi ảnh, chỉ tính phần sampler, đã đồng bộ, bỏ batch đầu tiên.
+
+Chạy tiếp và tái lập:
+- **Nhiễu cố định theo mẫu:** nhiễu ban đầu của mỗi mẫu chỉ phụ thuộc `(seed, chỉ số mẫu)`, nên kết quả không đổi theo batch size.
+- **Chạy tiếp:** chạy lại đúng lệnh cũ sẽ tiếp tục từ chỗ dừng.
+- **Chống ghi đè nhầm:** nếu đổi checkpoint hoặc cấu hình mà vẫn dùng thư mục cũ, script dừng. Khi đó đổi `OUT` hoặc thêm `--overwrite`.
+- **Dung lượng:** ảnh PNG 1024 × 768 khoảng 1–1,5 MB mỗi ảnh, tức khoảng 5–6 GB cho mỗi CFG (paired + unpaired).
+
+Gộp mean ± std theo seed lấy mẫu, cho các thư mục nằm cùng một chỗ, ví dụ `outputs/eval/`:
+
+```bash
+for s in 42 123 2026; do SEED=$s bash scripts/eval_pfi_test.sh logs/vton-v50-attn-flow/latest.pt; done
+python3 scripts/aggregate_pfi_eval.py --root outputs/eval
+```
+
+### 5.2. Trên Modal (tùy chọn)
+
+[`docs/experiment/infer_modal.py`](../docs/experiment/infer_modal.py) dùng cùng thước đo, chạy trên H100 với volume `VTON-HD`. Script chỉ giữ 16 ảnh dự đoán mỗi cấu hình, nên muốn có ảnh và thước đo cho từng mẫu thì dùng mục 5.1. Mỗi cấu hình cần một `--output-tag` riêng.
+
+```bash
+modal run docs/experiment/infer_modal.py --nfe 50 --cfg-scales 1.5 --seed 42 --output-tag v50-la50-cfg1.5-seed42
 modal run docs/experiment/infer_modal.py --sampler euler --nfe 50 --cfg-scales 1.5 --output-tag v50-euler50-cfg1.5-seed42
-# V50: tham số look-ahead (p = phân vị độ bất định; context ratio = khoảng nhìn trước)
 modal run docs/experiment/infer_modal.py --nfe 50 --cfg-scales 1.5 --p 0.5 --output-tag v50-la50-p05-cfg1.5-seed42
-modal run docs/experiment/infer_modal.py --nfe 50 --cfg-scales 1.5 --context-ratio 2.0 --output-tag v50-la50-r20-cfg1.5-seed42
-# Một nhánh ablation (E1 chạy thêm --sampler euler)
 modal run docs/experiment/infer_modal.py --checkpoint /data/logs/ablation/e1_shared_timestep/latest.pt \
     --config-path configs/ablation/e1_shared_timestep.yaml --nfe 50 --cfg-scales 1.5 --output-tag e1-la50-cfg1.5-seed42
-# Gộp mean ± std theo seed, sau khi tải các file JSON về
-modal volume get VTON-HD experiments ./experiments
-python3 scripts/aggregate_pfi_eval.py --root ./experiments
+modal volume get VTON-HD experiments ./experiments && python3 scripts/aggregate_pfi_eval.py --root ./experiments
 ```
 
 Lưu ý khi diễn giải kết quả:
 - **Hai loại độ lệch chuẩn:** std theo seed lấy mẫu khác với std theo tập con của KID; không trộn hai loại.
 - **Một seed train mỗi nhánh:** chênh lệch nhỏ hơn độ lệch theo seed lấy mẫu thì chưa đủ để kết luận.
-- **Xem ảnh crop:** luôn xem crop vùng áo và logo bên cạnh các con số, vì FID/KID không cho biết chữ có đúng hay không.
+- **Xem ảnh:** luôn xem ảnh vùng áo và logo bên cạnh các con số, vì FID/KID không cho biết chữ có đúng hay không. `per_sample.csv` giúp tìm nhanh các mẫu tệ nhất theo LPIPS.
 
 ## 6. Kiểm thử
 
