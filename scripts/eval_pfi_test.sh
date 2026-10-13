@@ -37,7 +37,7 @@ SEED=${SEED:-42}
 BATCH_SIZE=${BATCH_SIZE:-8}
 LIMIT=${LIMIT:-0}
 run=$(basename "$(dirname "$CKPT")")
-OUT=${OUT:-outputs/eval/${run}-${SAMPLER}${NFE}-cfg${CFG_SCALES//,/_}-seed${SEED}$([[ $LIMIT != 0 ]] && echo "-limit$LIMIT")}
+OUT=${OUT:-outputs/eval/${run}-${SAMPLER}${NFE}-cfg${CFG_SCALES//,/_}-seed${SEED}$([[ $LIMIT != 0 ]] && echo "-limit$LIMIT" || true)}
 
 export PYTHONPATH=.
 export PYTHONUNBUFFERED=1
